@@ -12,6 +12,9 @@ DFINETransformer:
   which_keypoints: *vehicle_keypoints
 
 RTv4Criterion:
+  # Override the matcher injected into this criterion.
+  matcher:
+    weight_dict: {cost_class: 0, cost_bbox: 5, cost_giou: 2}
   which_keypoints: *vehicle_keypoints
   losses: ['mal', 'boxes', 'local', 'distill', 'keypoints']
   loss_keypoints_xy_weight: 10.0

@@ -237,6 +237,21 @@ The JSON files must use COCO detection format. Each pose annotation must contain
 Annotations without `keypoints` are supported and remain bbox-supervised. Custom
 `category_id` values must be contiguous and zero-based (`0 .. num_classes - 1`).
 
+The vehicle configurations set the Hungarian matcher's classification cost to
+zero. Assignment therefore uses only bounding-box L1 and generalized-IoU costs;
+predicted keypoint coordinates, keypoint visibility, and keypoint annotations do
+not affect which query is paired with which target. Keypoint losses are computed
+only after this box-only assignment.
+
+If every keypoint loss is exactly zero, inspect the annotations rather than the
+ordering of the five datasets. `MultiDataSampler` draws a dataset independently
+for every sample, so pose and bbox-only datasets are interleaved. A batch has
+zero pose loss when none of its matched objects has a non-ignored keypoint with
+visibility greater than zero. Training emits a warning after 100 consecutive
+such batches; this usually means the sampled COCO annotations have no
+`keypoints`, contain only zero visibility values, or pose-bearing categories were
+filtered by `class_names`.
+
 Train:
 
 ```shell
@@ -503,6 +518,30 @@ If you'd like to train **RT-DETRv4** on COCO2017 with an input size of 320x320, 
     python tools/inference/trt_inf.py --trt model.engine --input image.jpg
     python tools/inference/torch_inf.py -c configs/rtv4/rtv4_hgnetv2_${model}_coco.yml -r model.pth --input image.jpg --device cuda:0
     ```
+
+### Checkpoint inference with JSON and keypoint visualization
+
+The native checkpoint inference tool accepts either one image or a directory,
+writes all filtered detections to JSON, and can draw bounding boxes and predicted
+keypoints. Output coordinates and visualizations use each source image's original
+resolution even when the network processes a different rectangular resolution.
+
+```shell
+python tools/inference/checkpoint_inference.py \
+  --config configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml \
+  --checkpoint output/best_stg2.pth \
+  --input /path/to/images \
+  --output-dir inference_results \
+  --input-size 672 1184 \
+  --score-threshold 0.4 \
+  --keypoint-threshold 0.5 \
+  --visualize --recursive
+```
+
+By default the JSON is saved as `inference_results/predictions.json`. Use
+`--json-output /path/to/results.json` to override it. Checkpoints containing an
+EMA are inferred with the EMA weights; `model`, `state_dict`, and raw state-dict
+checkpoint layouts are also supported.
 
 </details>
 

@@ -388,8 +388,7 @@ class HybridEncoder(nn.Module):
                 pos_embed = self.build_2d_sincos_position_embedding(
                     self.eval_spatial_size[1] // stride, self.eval_spatial_size[0] // stride,
                     self.hidden_dim, self.pe_temperature)
-                setattr(self, f'pos_embed{idx}', pos_embed)
-                # self.register_buffer(f'pos_embed{idx}', pos_embed)
+                self.register_buffer(f'pos_embed{idx}', pos_embed, persistent=False)
 
     @staticmethod
     def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000., device=None):
@@ -431,6 +430,8 @@ class HybridEncoder(nn.Module):
                         pos_embed = self.build_2d_sincos_position_embedding(
                             w, h, self.hidden_dim, self.pe_temperature,
                             device=src_flatten.device)
+                    else:
+                        pos_embed = pos_embed.to(device=src_flatten.device)
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, src_mask=None, pos_embed=pos_embed)
 
