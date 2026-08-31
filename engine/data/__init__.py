@@ -21,3 +21,4 @@ from ._misc import convert_to_tv_tensor
 #     for ds in datasets:
 #         register(ds)(set_epoch)
 # _set_epoch_func([CIFAR10, VOCDetection, CocoDetection])
+from .dataset.vehicle_keypoint_metric import VehicleKeypointMetric
