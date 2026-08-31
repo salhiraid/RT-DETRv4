@@ -4,10 +4,11 @@ from PIL import Image
 
 from engine.data.dataset.coco_dataset import ConvertCocoPolysToMask
 from engine.data.dataset.coco_dataset import MultiCocoDetection
+from engine.data.dataset.coco_dataset import WeightedMultiDataset
 from engine.data.dataloader import MultiDataSampler
 from engine.data.dataset.vehicle_keypoint_metric import VehicleKeypointMetric
 from engine.data.dataset.coco_eval import VehicleCocoEvaluator
-from engine.rtv4.dfine_decoder import MLP, TransformerDecoder
+from engine.rtv4.dfine_decoder import DFINETransformer, MLP, TransformerDecoder
 from engine.rtv4.postprocessor import PostProcessor
 from engine.rtv4.rtv4_criterion import RTv4Criterion
 
@@ -42,6 +43,34 @@ def test_bbox_local_decode_shapes_geometry_and_backward():
     assert boxes.grad is None
     assert branch_xy.layers[-1].weight.grad.abs().sum() > 0
     assert branch_vis.layers[-1].weight.grad.abs().sum() > 0
+
+
+def test_keypoint_heads_are_shared_deep_branches():
+    model = DFINETransformer(
+        num_classes=1, hidden_dim=16, num_queries=10,
+        feat_channels=[16, 16, 16], num_layers=3,
+        dim_feedforward=32, nhead=4, which_keypoints=list(range(31)),
+        num_reg_fcs=2)
+
+    assert len(model.kps_xy_branches) == len(model.kps_vis_branches) == 1
+    xy_layers = list(model.kps_xy_branches[0])
+    vis_layers = list(model.kps_vis_branches[0])
+    assert len([layer for layer in xy_layers if isinstance(layer, torch.nn.Linear)]) == 5
+    assert len([layer for layer in xy_layers if isinstance(layer, torch.nn.ReLU)]) == 4
+    assert xy_layers[-1].out_features == 62
+    assert vis_layers[-1].out_features == 31
+
+
+def test_keypoint_parameter_count_is_independent_of_evaluation_resolution():
+    kwargs = dict(
+        num_classes=1, hidden_dim=16, num_queries=10,
+        feat_channels=[16, 16, 16], num_layers=3,
+        dim_feedforward=32, nhead=4, which_keypoints=list(range(31)))
+    small = DFINETransformer(eval_spatial_size=[400, 400], **kwargs)
+    large = DFINETransformer(eval_spatial_size=[672, 1184], **kwargs)
+
+    count = lambda model: sum(parameter.numel() for parameter in model.parameters())
+    assert count(small) == count(large)
 
 
 class Matcher:
@@ -177,6 +206,53 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
     first_epoch = list(iter(sampler))
     sampler.set_epoch(1)
     assert first_epoch != list(iter(sampler))
+
+
+def test_weighted_multi_dataset_uses_nested_coco_configs(tmp_path):
+    from engine.core.workspace import create
+    from engine.core.yaml_utils import merge_config
+
+    dataset_configs = []
+    for dataset_index in range(2):
+        folder = tmp_path / f'weighted_images_{dataset_index}'
+        folder.mkdir()
+        Image.new('RGB', (32, 16)).save(folder / 'sample.jpg')
+        annotation_file = tmp_path / f'weighted_{dataset_index}.json'
+        annotation_file.write_text(json.dumps({
+            'images': [{'id': 1, 'file_name': 'sample.jpg',
+                        'width': 32, 'height': 16}],
+            'annotations': [{'id': 1, 'image_id': 1, 'category_id': 1,
+                             'bbox': [1, 1, 10, 8], 'area': 80,
+                             'iscrowd': 0}],
+            'categories': [{'id': 1, 'name': 'vehicle'}],
+        }))
+        dataset_configs.append({
+            'type': 'CocoDetection', 'img_folder': str(folder),
+            'ann_file': str(annotation_file), 'transforms': None,
+            'return_masks': False, 'remap_mscoco_category': False,
+            'num_keypoints': 31,
+        })
+
+    config = merge_config({
+        'weighted_test_dataset': {
+            'type': 'WeightedMultiDataset', 'datasets': dataset_configs,
+            'weights': [0.7, 0.3], 'samples_per_epoch': 1000, 'seed': 42,
+            'transforms': None,
+        }
+    })
+    dataset = create('weighted_test_dataset', config)
+
+    assert isinstance(dataset, WeightedMultiDataset)
+    assert all(dataset._transforms is None for dataset in dataset.datasets)
+    assert len(dataset) == 1000
+    selected = [dataset_index for dataset_index, _ in dataset.index_map]
+    assert 0.65 < selected.count(0) / len(selected) < 0.75
+    first_epoch = list(dataset.index_map)
+    dataset.set_epoch(1)
+    assert first_epoch != dataset.index_map
+    image, target = dataset[0]
+    assert image.size == (32, 16)
+    assert target['keypoints'].shape == (1, 31, 2)
 
 
 def test_dinov3_teacher_validates_paths_and_supports_rectangular_grid(tmp_path, monkeypatch):

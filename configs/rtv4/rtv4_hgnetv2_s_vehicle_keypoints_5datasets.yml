@@ -13,31 +13,21 @@ teacher_model:
 num_classes: 5
 class_names: &vehicle_classes [bicycle, car, motorcycle, bus, truck]
 
-# Five training datasets are concatenated before the shared keypoint pipeline.
-# Category ids/order may differ, but names and 31-keypoint semantics must agree.
+# Each virtual epoch draws 50,000 samples from five ordinary COCO datasets.
+# Child transforms stay disabled because the wrapper applies the shared pipeline.
 train_dataloader:
-  shuffle: False  # a sampler and shuffle=True are mutually exclusive
-  sampler:
-    type: MultiDataSampler
-    dataset_ratio: [25, 35, 15, 15, 10]
-    max_samples: 300000
+  shuffle: True
   dataset:
-    type: MultiCocoDetection
-    img_folders:
-      - /absolute/path/to/dataset_1/images/train
-      - /absolute/path/to/dataset_2/images/train
-      - /absolute/path/to/dataset_3/images/train
-      - /absolute/path/to/dataset_4/images/train
-      - /absolute/path/to/dataset_5/images/train
-    ann_files:
-      - /absolute/path/to/dataset_1/annotations/train.json
-      - /absolute/path/to/dataset_2/annotations/train.json
-      - /absolute/path/to/dataset_3/annotations/train.json
-      - /absolute/path/to/dataset_4/annotations/train.json
-      - /absolute/path/to/dataset_5/annotations/train.json
-
-    # Keep these at one when MultiDataSampler controls the sampling ratio.
-    repeat_factors: [1, 1, 1, 1, 1]
+    type: WeightedMultiDataset
+    weights: [0.35, 0.25, 0.20, 0.12, 0.08]
+    samples_per_epoch: 50000
+    seed: 42
+    datasets:
+      - {type: CocoDetection, img_folder: /absolute/path/to/dataset_1/images/train, ann_file: /absolute/path/to/dataset_1/annotations/train.json, transforms: null, return_masks: false, remap_mscoco_category: false, num_keypoints: 31}
+      - {type: CocoDetection, img_folder: /absolute/path/to/dataset_2/images/train, ann_file: /absolute/path/to/dataset_2/annotations/train.json, transforms: null, return_masks: false, remap_mscoco_category: false, num_keypoints: 31}
+      - {type: CocoDetection, img_folder: /absolute/path/to/dataset_3/images/train, ann_file: /absolute/path/to/dataset_3/annotations/train.json, transforms: null, return_masks: false, remap_mscoco_category: false, num_keypoints: 31}
+      - {type: CocoDetection, img_folder: /absolute/path/to/dataset_4/images/train, ann_file: /absolute/path/to/dataset_4/annotations/train.json, transforms: null, return_masks: false, remap_mscoco_category: false, num_keypoints: 31}
+      - {type: CocoDetection, img_folder: /absolute/path/to/dataset_5/images/train, ann_file: /absolute/path/to/dataset_5/annotations/train.json, transforms: null, return_masks: false, remap_mscoco_category: false, num_keypoints: 31}
 
 # Evaluation intentionally uses one stable validation set. Change these two paths
 # to the validation dataset on which you want bbox/keypoint metrics reported.
