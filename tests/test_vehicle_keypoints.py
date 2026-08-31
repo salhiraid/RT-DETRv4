@@ -229,3 +229,12 @@ def test_profiler_uses_rectangular_eval_spatial_size(monkeypatch):
     monkeypatch.setattr(profiler, 'calculate_flops', fake_flops)
     profiler.stats(Config())
     assert captured['input_shape'] == (1, 3, 672, 1184)
+
+
+def test_yaml_config_exposes_eval_spatial_size(tmp_path):
+    from engine.core.yaml_config import YAMLConfig
+
+    config_path = tmp_path / 'geometry.yml'
+    config_path.write_text('eval_spatial_size: [672, 1184]\n')
+    config = YAMLConfig(str(config_path))
+    assert config.eval_spatial_size == [672, 1184]
