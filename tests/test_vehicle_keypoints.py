@@ -238,3 +238,29 @@ def test_yaml_config_exposes_eval_spatial_size(tmp_path):
     config_path.write_text('eval_spatial_size: [672, 1184]\n')
     config = YAMLConfig(str(config_path))
     assert config.eval_spatial_size == [672, 1184]
+
+
+def test_checkpoint_inference_json_preserves_original_coordinates(tmp_path):
+    from tools.inference.checkpoint_inference import (
+        checkpoint_state, discover_images, prediction_to_json, visualize)
+
+    image_path = tmp_path / 'frame.jpg'
+    Image.new('RGB', (1200, 700)).save(image_path)
+    assert discover_images(tmp_path) == [image_path]
+    weights = {'weight': torch.ones(1)}
+    assert checkpoint_state({'ema': {'module': weights}}) is weights
+
+    result = {
+        'labels': torch.tensor([3]),
+        'scores': torch.tensor([.9]),
+        'boxes': torch.tensor([[100., 50., 1100., 650.]]),
+        'keypoints': torch.tensor([[[600., 350.], [900., 500.]]]),
+        'keypoint_scores': torch.tensor([[.8, .2]]),
+    }
+    record = prediction_to_json(image_path, 1200, 700, result, .4, .5)
+    detection = record['detections'][0]
+    assert detection['bbox_xyxy'] == [100., 50., 1100., 650.]
+    assert detection['bbox_xywh'] == [100., 50., 1000., 600.]
+    assert detection['visible_keypoints'] == [True, False]
+    rendered = visualize(Image.open(image_path), record, .5)
+    assert rendered.size == (1200, 700)

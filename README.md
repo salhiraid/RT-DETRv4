@@ -504,6 +504,30 @@ If you'd like to train **RT-DETRv4** on COCO2017 with an input size of 320x320, 
     python tools/inference/torch_inf.py -c configs/rtv4/rtv4_hgnetv2_${model}_coco.yml -r model.pth --input image.jpg --device cuda:0
     ```
 
+### Checkpoint inference with JSON and keypoint visualization
+
+The native checkpoint inference tool accepts either one image or a directory,
+writes all filtered detections to JSON, and can draw bounding boxes and predicted
+keypoints. Output coordinates and visualizations use each source image's original
+resolution even when the network processes a different rectangular resolution.
+
+```shell
+python tools/inference/checkpoint_inference.py \
+  --config configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml \
+  --checkpoint output/best_stg2.pth \
+  --input /path/to/images \
+  --output-dir inference_results \
+  --input-size 672 1184 \
+  --score-threshold 0.4 \
+  --keypoint-threshold 0.5 \
+  --visualize --recursive
+```
+
+By default the JSON is saved as `inference_results/predictions.json`. Use
+`--json-output /path/to/results.json` to override it. Checkpoints containing an
+EMA are inferred with the EMA weights; `model`, `state_dict`, and raw state-dict
+checkpoint layouts are also supported.
+
 </details>
 
 <details>
