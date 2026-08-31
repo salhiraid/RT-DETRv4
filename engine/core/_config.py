@@ -82,6 +82,9 @@ class BaseConfig(object):
         self.output_dir :str = None
         self.summary_dir :str = None
         self.device : str = ''
+        # Model input geometry in [height, width] order. Declaring this on the
+        # base config allows YAMLConfig to expose the top-level YAML value.
+        self.eval_spatial_size = None
 
         # distillation: General distillation control switch
         self._teacher_model: nn.Module = None

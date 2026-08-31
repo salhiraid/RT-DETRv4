@@ -4,13 +4,14 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 # from ._dataset import DetDataset
-from .coco_dataset import CocoDetection
+from .coco_dataset import CocoDetection, MultiCocoDetection
 from .coco_dataset import (
     mscoco_category2name,
     mscoco_category2label,
     mscoco_label2category,
 )
-from .coco_eval import CocoEvaluator
+from .coco_eval import CocoEvaluator, VehicleCocoEvaluator
 from .coco_utils import get_coco_api_from_dataset
 from .voc_detection import VOCDetection
 from .voc_eval import VOCEvaluator
+from .vehicle_keypoint_metric import VehicleKeypointMetric

@@ -6,6 +6,7 @@ Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
 import torch
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as F
+import torchvision.transforms.functional as legacy_F
 import random
 from PIL import Image
 
@@ -45,11 +46,26 @@ class Mosaic(T.Transform):
         self.max_cached_images = max_cached_images
         self.random_pop = random_pop
 
+    def _resize_sample(self, image, target):
+        """Resize image/boxes and pose coordinates with one shared scale."""
+        get_size = F.get_size if hasattr(F, 'get_size') else F.get_spatial_size
+        old_h, old_w = get_size(image)
+        keypoints = target.pop('keypoints', None)
+        image, target = self.resize(image, target)
+        if keypoints is not None:
+            new_h, new_w = get_size(image)
+            keypoints = keypoints.clone()
+            valid = target['keypoints_visible'] > 0
+            keypoints[..., 0][valid] *= new_w / old_w
+            keypoints[..., 1][valid] *= new_h / old_h
+            target['keypoints'] = keypoints
+        return image, target
+
     def load_samples_from_dataset(self, image, target, dataset):
         """Loads and resizes a set of images and their corresponding targets."""
         # Append the main image
         get_size_func = F.get_size if hasattr(F, "get_size") else F.get_spatial_size  # torchvision >=0.17 is get_size
-        image, target = self.resize(image, target)
+        image, target = self._resize_sample(image, target)
         resized_images, resized_targets = [image], [target]
         max_height, max_width = get_size_func(resized_images[0])
 
@@ -57,7 +73,7 @@ class Mosaic(T.Transform):
         sample_indices = random.choices(range(len(dataset)), k=3)
         for idx in sample_indices:
             # image, target = dataset.load_item(idx)
-            image, target = self.resize(dataset.load_item(idx))
+            image, target = self._resize_sample(*dataset.load_item(idx))
             height, width = get_size_func(image)
             max_height, max_width = max(max_height, height), max(max_width, width)
             resized_images.append(image)
@@ -66,7 +82,7 @@ class Mosaic(T.Transform):
         return resized_images, resized_targets, max_height, max_width
 
     def load_samples_from_cache(self, image, target, cache):
-        image, target = self.resize(image, target)
+        image, target = self._resize_sample(image, target)
         cache.append(dict(img=image, labels=target))
 
         if len(cache) > self.max_cached_images:
@@ -99,6 +115,10 @@ class Mosaic(T.Transform):
 
             merged_image.paste(img, placement_offsets[i])
             target['boxes'] = target['boxes'] + offsets[i]
+            if 'keypoints' in target:
+                valid = target['keypoints_visible'] > 0
+                target['keypoints'][..., 0][valid] += placement_offsets[i][0]
+                target['keypoints'][..., 1][valid] += placement_offsets[i][1]
             mosaic_target.append(target)
 
         merged_target = {}
@@ -120,6 +140,14 @@ class Mosaic(T.Transform):
         for key in targets[0]:
             if key == 'boxes':
                 values = [target[key] + offsets[i] for i, target in enumerate(targets)]
+            elif key == 'keypoints':
+                values = []
+                for i, target in enumerate(targets):
+                    value = target[key].clone()
+                    valid = target['keypoints_visible'] > 0
+                    value[..., 0][valid] += placement_offsets[i][0]
+                    value[..., 1][valid] += placement_offsets[i][1]
+                    values.append(value)
             else:
                 values = [target[key] for target in targets]
 
@@ -162,7 +190,46 @@ class Mosaic(T.Transform):
         if 'masks' in mosaic_target:
             mosaic_target['masks'] = convert_to_tv_tensor(mosaic_target['masks'], 'masks')
 
-        # Apply affine transformations
-        mosaic_image, mosaic_target = self.affine_transform(mosaic_image, mosaic_target)
+        # Apply one sampled affine to image, boxes and keypoints. Plain tensors
+        # are not keypoint-aware in torchvision v2, so pose coordinates must be
+        # transformed explicitly with the forward form of the same matrix.
+        height, width = mosaic_image.size[1], mosaic_image.size[0]
+        angle, translate, scale, shear = T.RandomAffine.get_params(
+            self.affine_transform.degrees, self.affine_transform.translate,
+            self.affine_transform.scale, self.affine_transform.shear,
+            [width, height])
+        keypoints = mosaic_target.pop('keypoints', None)
+        mosaic_image = F.affine(mosaic_image, angle, translate, scale, shear,
+                                interpolation=self.affine_transform.interpolation,
+                                fill=self.affine_transform.fill,
+                                center=self.affine_transform.center)
+        mosaic_target['boxes'] = F.affine(
+            mosaic_target['boxes'], angle, translate, scale, shear,
+            interpolation=self.affine_transform.interpolation,
+            fill=self.affine_transform.fill,
+            center=self.affine_transform.center)
+        if 'masks' in mosaic_target:
+            mosaic_target['masks'] = F.affine(
+                mosaic_target['masks'], angle, translate, scale, shear,
+                interpolation=self.affine_transform.interpolation,
+                fill=0, center=self.affine_transform.center)
+        if keypoints is not None:
+            center = self.affine_transform.center or [width * 0.5, height * 0.5]
+            inverse = legacy_F._get_inverse_affine_matrix(
+                center, angle, translate, scale, shear)
+            matrix = torch.tensor([
+                inverse[:3], inverse[3:], [0., 0., 1.]
+            ], dtype=keypoints.dtype, device=keypoints.device)
+            forward = torch.linalg.inv(matrix)
+            homogeneous = torch.cat(
+                [keypoints, torch.ones_like(keypoints[..., :1])], dim=-1)
+            transformed = homogeneous @ forward.T
+            transformed = transformed[..., :2]
+            visible = mosaic_target['keypoints_visible']
+            inside = ((transformed[..., 0] >= 0) & (transformed[..., 0] <= width) &
+                      (transformed[..., 1] >= 0) & (transformed[..., 1] <= height))
+            transformed[(visible <= 0) | ~inside] = 0
+            visible[~inside] = 0
+            mosaic_target['keypoints'] = transformed
 
         return mosaic_image, mosaic_target, dataset

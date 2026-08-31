@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..core import register
 import logging
+from pathlib import Path
 from torchvision.transforms import v2 as transforms
 
 _logger = logging.getLogger(__name__)
@@ -27,16 +28,35 @@ class DINOv3TeacherModel(nn.Module):
         self.dinov3_weights_path = dinov3_weights_path
         self.patch_size = patch_size
 
+        repo_path = Path(dinov3_repo_path).expanduser().resolve()
+        weights_path = Path(dinov3_weights_path).expanduser().resolve()
+        hubconf_path = repo_path / 'hubconf.py'
+        if not hubconf_path.is_file():
+            raise FileNotFoundError(
+                'DINOv3 repository is not installed at the configured path. '
+                f'Expected: {hubconf_path}\n'
+                'Clone the official DINOv3 repository there, or set '
+                '`teacher_model.dinov3_repo_path` to the directory that contains '
+                '`hubconf.py`.')
+        if not weights_path.is_file():
+            raise FileNotFoundError(
+                'DINOv3 teacher checkpoint was not found. '
+                f'Expected: {weights_path}\n'
+                'Download the checkpoint and set '
+                '`teacher_model.dinov3_weights_path` to its file path.')
+        self.dinov3_repo_path = str(repo_path)
+        self.dinov3_weights_path = str(weights_path)
+
         _logger.info(f"[Teacher Model] Attempting to load DINOv3 teacher via torch.hub.load...")
-        _logger.info(f"[Teacher Model] DINOv3 repo path: {dinov3_repo_path}")
-        _logger.info(f"[Teacher Model] DINOv3 weights path: {dinov3_weights_path}")
+        _logger.info(f"[Teacher Model] DINOv3 repo path: {self.dinov3_repo_path}")
+        _logger.info(f"[Teacher Model] DINOv3 weights path: {self.dinov3_weights_path}")
 
         try:
             self.model = torch.hub.load(
-                dinov3_repo_path,
+                self.dinov3_repo_path,
                 dinov3_model_type,
                 source='local',
-                weights=dinov3_weights_path
+                weights=self.dinov3_weights_path
             )
             self.model.eval()
             for param in self.model.parameters():
@@ -70,12 +90,15 @@ class DINOv3TeacherModel(nn.Module):
 
             B, N_patches, C_teacher = patch_tokens.shape
 
-            H_patches_out = W_patches_out = int(N_patches ** 0.5)
+            H_patches_out = processed_images.shape[-2] // self.patch_size
+            W_patches_out = processed_images.shape[-1] // self.patch_size
             if H_patches_out * W_patches_out != N_patches:
                 _logger.error(
                     f"[Teacher Model] Number of patches {N_patches} is not a perfect square for spatial reshape. Input image size: {images.shape[2:]}. Patch size: {self.patch_size}.")
                 raise ValueError(
-                    f"Number of patches {N_patches} is not a perfect square, cannot reshape to HxW. Check DINOv3 model output or input image size vs patch_size.")
+                    f"Number of patches {N_patches} does not match the expected "
+                    f"{H_patches_out}x{W_patches_out} grid. Check the input size "
+                    "and configured patch_size.")
 
             teacher_feature_map = patch_tokens.permute(0, 2, 1).reshape(B, C_teacher, H_patches_out, W_patches_out)
 
