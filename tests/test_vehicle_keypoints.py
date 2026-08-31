@@ -140,20 +140,22 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
             'images': [{'id': dataset_index + 1, 'file_name': 'sample.jpg',
                         'width': 32, 'height': 16}],
             'annotations': [{'id': dataset_index + 1, 'image_id': dataset_index + 1,
-                             'category_id': 0, 'bbox': [1, 1, 10, 8],
+                             'category_id': 10 + dataset_index, 'bbox': [1, 1, 10, 8],
                              'area': 80, 'iscrowd': 0}],
-            'categories': [{'id': 0, 'name': 'vehicle'}],
+            'categories': [{'id': 10 + dataset_index, 'name': 'vehicle'}],
         }
         annotation_file = tmp_path / f'dataset_{dataset_index}.json'
         annotation_file.write_text(json.dumps(annotation))
         image_folders.append(str(folder)); annotation_files.append(str(annotation_file))
     dataset = MultiCocoDetection(
-        image_folders, annotation_files, transforms=None, repeat_factors=[1, 2])
+        image_folders, annotation_files, transforms=None, repeat_factors=[1, 2],
+        class_names=['vehicle'])
     assert len(dataset) == 3
     _, target = dataset.load_item(2)
     assert target['boxes'].shape == (1, 4)
     assert target['keypoints'].shape == (1, 31, 2)
     assert target['ignore_keypoints'].item()
+    assert target['labels'].item() == 0
 
     sampler = MultiDataSampler(dataset, dataset_ratio=[25, 75],
                                max_samples=2000, seed=7)
@@ -163,3 +165,55 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
     first_epoch = list(iter(sampler))
     sampler.set_epoch(1)
     assert first_epoch != list(iter(sampler))
+
+
+def test_dinov3_teacher_validates_paths_and_supports_rectangular_grid(tmp_path, monkeypatch):
+    from engine.rtv4.dinov3_teacher import DINOv3TeacherModel
+    missing = tmp_path / 'missing_repo'
+    try:
+        DINOv3TeacherModel(str(missing), str(tmp_path / 'missing.pth'))
+    except FileNotFoundError as error:
+        assert 'hubconf.py' in str(error)
+    else:
+        raise AssertionError('missing DINOv3 repository must fail before torch.hub.load')
+
+    repo = tmp_path / 'dinov3'; repo.mkdir(); (repo / 'hubconf.py').touch()
+    weights = tmp_path / 'teacher.pth'; weights.touch()
+
+    class FakeDINO(torch.nn.Module):
+        embed_dim = 8
+
+        def forward(self, images, is_training=True, masks=None):
+            h, w = images.shape[-2] // 16, images.shape[-1] // 16
+            return {'x_norm_patchtokens': images.new_zeros(images.shape[0], h * w, 8)}
+
+    monkeypatch.setattr(torch.hub, 'load', lambda *args, **kwargs: FakeDINO())
+    teacher = DINOv3TeacherModel(str(repo), str(weights), patch_size=16)
+    features = teacher(torch.zeros(1, 3, 672, 1184))
+    assert features.shape == (1, 8, 21, 37)
+
+
+def test_profiler_uses_rectangular_eval_spatial_size(monkeypatch):
+    import engine.misc.profiler_utils as profiler
+
+    captured = {}
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def deploy(self):
+            return self
+
+    def fake_flops(model, input_shape, **kwargs):
+        captured['input_shape'] = input_shape
+        return '1', '1', None
+
+    class Config:
+        eval_spatial_size = [672, 1184]
+        model = DummyModel()
+
+    monkeypatch.setattr(profiler, 'calculate_flops', fake_flops)
+    profiler.stats(Config())
+    assert captured['input_shape'] == (1, 3, 672, 1184)

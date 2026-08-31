@@ -52,6 +52,10 @@ train_dataloader:
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: ConvertPILImage, dtype: float32, scale: True}
         - {type: ConvertBoxes, fmt: cxcywh, normalize: True}
+  collate_fn:
+    # Keep the configured rectangular H x W geometry. The upstream
+    # scalar multi-scale collate resizes batches to squares and must be disabled.
+    base_size_repeat: ~
 
 val_dataloader:
   dataset:

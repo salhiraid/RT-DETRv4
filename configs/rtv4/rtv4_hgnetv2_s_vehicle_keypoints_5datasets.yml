@@ -2,8 +2,19 @@ __include__: [
   './rtv4_hgnetv2_s_vehicle_keypoints.yml'
 ]
 
+# RT-DETRv4 distillation requires the local DINOv3 repository and checkpoint.
+# `dinov3_repo_path` must be the directory that contains DINOv3's hubconf.py.
+teacher_model:
+  dinov3_repo_path: ./dinov3
+  dinov3_weights_path: ./pretrain/dinov3_vitb16_pretrain_lvd1689m.pth
+
+# EDIT these five names so they exactly match the `name` fields in every JSON's
+# categories list. Local category ids may differ; they are remapped by name.
+num_classes: 5
+class_names: &vehicle_classes [class_0, class_1, class_2, class_3, class_4]
+
 # Five training datasets are concatenated before the shared keypoint pipeline.
-# All five JSON files must use identical categories and 31-keypoint semantics.
+# Category ids/order may differ, but names and 31-keypoint semantics must agree.
 train_dataloader:
   shuffle: False  # a sampler and shuffle=True are mutually exclusive
   sampler:
@@ -34,3 +45,6 @@ val_dataloader:
   dataset:
     img_folder: /absolute/path/to/evaluation_dataset/images/val
     ann_file: /absolute/path/to/evaluation_dataset/annotations/val.json
+
+evaluator:
+  class_names: *vehicle_classes

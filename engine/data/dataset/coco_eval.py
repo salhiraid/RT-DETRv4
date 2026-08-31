@@ -206,8 +206,23 @@ class VehicleCocoEvaluator(CocoEvaluator):
     def __init__(self, coco_gt, iou_types=('bbox',), num_keypoints=31,
                  thresholds=(5.0, 10.0), iou_thr=.5, vis_thr=.5,
                  score_thr=.05, margin=.05, crop_size=512,
-                 min_bbox_size=64.):
+                 min_bbox_size=64., class_names=None):
         super().__init__(coco_gt, iou_types)
+        self.class_names = list(class_names) if class_names is not None else None
+        self.label2category = None
+        if self.class_names is not None:
+            name_to_category = {
+                category['name']: category['id']
+                for category in self.coco_gt.dataset['categories']
+            }
+            missing = set(self.class_names) - set(name_to_category)
+            if missing:
+                raise ValueError(
+                    f'Validation JSON is missing configured classes: {sorted(missing)}')
+            self.label2category = {
+                index: name_to_category[name]
+                for index, name in enumerate(self.class_names)
+            }
         from .vehicle_keypoint_metric import VehicleKeypointMetric
         self.vehicle_metric = VehicleKeypointMetric(
             num_keypoints, thresholds, iou_thr, vis_thr, score_thr,
@@ -220,6 +235,17 @@ class VehicleCocoEvaluator(CocoEvaluator):
         self.vehicle_metrics = {}
 
     def update(self, predictions):
+        if self.label2category is not None:
+            predictions = {
+                image_id: {
+                    **prediction,
+                    'labels': prediction['labels'].new_tensor([
+                        self.label2category[int(label)]
+                        for label in prediction['labels']
+                    ])
+                }
+                for image_id, prediction in predictions.items()
+            }
         super().update(predictions)
         samples = []
         for image_id, pred in predictions.items():

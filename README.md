@@ -259,7 +259,8 @@ torchrun --nproc_per_node=1 train.py \
 For five training datasets, use
 [`configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml`](./configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml).
 Edit the five entries in `img_folders` and `ann_files`. All datasets must use
-the same category definitions and the same 31-keypoint ordering. The included
+the same class names and the same 31-keypoint ordering. Category ids and category
+order may differ because they are remapped by name through `class_names`. The included
 `MultiDataSampler` draws 300,000 samples per global epoch with the requested
 `[25, 35, 15, 15, 10]` percentage ratio:
 
@@ -276,6 +277,9 @@ train_dataloader:
     ann_files: [/data/a/train.json, /data/b/train.json, /data/c/train.json,
                 /data/d/train.json, /data/e/train.json]
     repeat_factors: [1, 1, 1, 1, 1]
+
+num_classes: 5
+class_names: [car, truck, bus, motorcycle, bicycle]
 ```
 
 The ratios are normalized, so they may also be written as decimal weights.
@@ -283,6 +287,11 @@ Sampling within each source dataset is with replacement. Keep
 `repeat_factors: [1, 1, 1, 1, 1]` because the sampler controls balancing.
 Use one stable validation dataset in `val_dataloader` so metrics remain directly
 comparable between epochs.
+
+Set `class_names` to the exact five strings used in the JSON `categories[*].name`
+fields. A source dataset may omit a class, but it must not introduce an unknown
+name. COCO annotation record ids (`annotations[*].id`) should start at 1; an
+annotation id of 0 is reserved as an unmatched marker by COCO evaluation.
 
 ```shell
 torchrun --nproc_per_node=1 train.py \
@@ -310,6 +319,49 @@ teacher_model:
 ```
 
 Update the `dinov3_repo_path` and `dinov3_weights_path` to match your local setup.
+
+The repository path must contain `hubconf.py`; it must not merely be an empty
+directory named `dinov3`. For example:
+
+```shell
+git clone https://github.com/facebookresearch/dinov3.git ./dinov3
+test -f ./dinov3/hubconf.py
+test -f ./pretrain/dinov3_vitb16_pretrain_lvd1689m.pth
+```
+
+If either `test` command fails, update the corresponding path in your keypoint
+config before launching training. RT-DETRv4 uses DINOv3 for its existing
+distillation task; the keypoint branches do not replace or disable that teacher.
+
+For rectangular keypoint training (for example `eval_spatial_size: [672, 1184]`),
+disable the upstream square multi-scale collate and keep every geometry setting
+consistent:
+
+```yaml
+eval_spatial_size: [672, 1184]
+
+train_dataloader:
+  collate_fn:
+    base_size_repeat: ~
+  dataset:
+    transforms:
+      ops:
+        # ... other transforms ...
+        - {type: Resize, size: [672, 1184]}
+
+val_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: FillKeypoints, num_keypoints: 31}
+        - {type: Resize, size: [672, 1184]}
+        - {type: ConvertPILImage, dtype: float32, scale: True}
+        - {type: ConvertBoxes, fmt: cxcywh, normalize: True}
+```
+
+The FLOPs profiler now uses `eval_spatial_size` rather than the collate function's
+legacy square `base_size`, so profiling and cached positional embeddings use the
+same spatial shape.
 
 ## 2\. Usage
 

@@ -28,9 +28,10 @@ NUM_KEYPOINTS = 31
 @register()
 class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     __inject__ = ['transforms', ]
-    __share__ = ['remap_mscoco_category']
+    __share__ = ['remap_mscoco_category', 'class_names']
 
-    def __init__(self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False):
+    def __init__(self, img_folder, ann_file, transforms, return_masks=False,
+                 remap_mscoco_category=False, class_names=None):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
@@ -38,6 +39,15 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         self.ann_file = ann_file
         self.return_masks = return_masks
         self.remap_mscoco_category = remap_mscoco_category
+        self.class_names = list(class_names) if class_names is not None else None
+        if self.class_names is not None:
+            if len(set(self.class_names)) != len(self.class_names):
+                raise ValueError('class_names must not contain duplicates')
+            unknown = set(self.category2name.values()) - set(self.class_names)
+            if unknown:
+                raise ValueError(
+                    f'{ann_file} contains categories absent from class_names: '
+                    f'{sorted(unknown)}')
 
     def __getitem__(self, idx):
         img, target = self.load_item(idx)
@@ -50,7 +60,14 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         image_id = self.ids[idx]
         target = {'image_id': image_id, 'annotations': target}
 
-        if self.remap_mscoco_category:
+        if self.class_names is not None:
+            name_to_label = {name: index for index, name in enumerate(self.class_names)}
+            category2label = {
+                category_id: name_to_label[name]
+                for category_id, name in self.category2name.items()
+            }
+            image, target = self.prepare(image, target, category2label=category2label)
+        elif self.remap_mscoco_category:
             image, target = self.prepare(image, target, category2label=mscoco_category2label)
         else:
             image, target = self.prepare(image, target)
@@ -88,6 +105,10 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
 
     @property
     def label2category(self, ):
+        if self.class_names is not None:
+            name_to_category = {cat['name']: cat['id'] for cat in self.categories}
+            return {index: name_to_category[name] for index, name in enumerate(self.class_names)
+                    if name in name_to_category}
         return {i: cat['id'] for i, cat in enumerate(self.categories)}
 
 
@@ -99,11 +120,12 @@ class MultiCocoDetection(DetDataset):
     be used to oversample smaller datasets by an integer factor.
     """
     __inject__ = ['transforms']
-    __share__ = ['remap_mscoco_category']
+    __share__ = ['remap_mscoco_category', 'class_names']
 
     def __init__(self, img_folders, ann_files, transforms,
                  repeat_factors=None, return_masks=False,
-                 remap_mscoco_category=False, img_folder=None, ann_file=None):
+                 remap_mscoco_category=False, class_names=None,
+                 img_folder=None, ann_file=None):
         if len(img_folders) != len(ann_files):
             raise ValueError('img_folders and ann_files must have the same length')
         if not img_folders:
@@ -115,13 +137,18 @@ class MultiCocoDetection(DetDataset):
         self.datasets = [
             CocoDetection(folder, annotation, transforms=None,
                           return_masks=return_masks,
-                          remap_mscoco_category=remap_mscoco_category)
+                          remap_mscoco_category=remap_mscoco_category,
+                          class_names=class_names)
             for folder, annotation in zip(img_folders, ann_files)
         ]
-        reference_categories = self.datasets[0].categories
-        for dataset in self.datasets[1:]:
-            if dataset.categories != reference_categories:
-                raise ValueError('All datasets must define identical COCO categories')
+        self.class_names = list(class_names) if class_names is not None else None
+        if self.class_names is None:
+            reference_categories = self.datasets[0].categories
+            for dataset in self.datasets[1:]:
+                if dataset.categories != reference_categories:
+                    raise ValueError(
+                        'Datasets use different COCO categories. Set class_names '
+                        'to the canonical class-name list to remap category ids by name.')
         self.index_map = [
             (dataset_index, sample_index)
             for dataset_index, (dataset, factor) in enumerate(zip(self.datasets, factors))
@@ -144,6 +171,9 @@ class MultiCocoDetection(DetDataset):
 
     @property
     def categories(self):
+        if self.class_names is not None:
+            return [{'id': index, 'name': name}
+                    for index, name in enumerate(self.class_names)]
         return self.datasets[0].categories
 
 
