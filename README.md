@@ -259,22 +259,28 @@ torchrun --nproc_per_node=1 train.py \
 For five training datasets, use
 [`configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml`](./configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml).
 Edit the five entries in `img_folders` and `ann_files`. All datasets must use
-the same category definitions and the same 31-keypoint ordering. By default,
-sampling is proportional to each dataset's number of images. Use integer
-`repeat_factors` to oversample smaller datasets:
+the same category definitions and the same 31-keypoint ordering. The included
+`MultiDataSampler` draws 300,000 samples per global epoch with the requested
+`[25, 35, 15, 15, 10]` percentage ratio:
 
 ```yaml
 train_dataloader:
+  shuffle: False
+  sampler:
+    type: MultiDataSampler
+    dataset_ratio: [25, 35, 15, 15, 10]
+    max_samples: 300000
   dataset:
     type: MultiCocoDetection
     img_folders: [/data/a/train, /data/b/train, /data/c/train, /data/d/train, /data/e/train]
     ann_files: [/data/a/train.json, /data/b/train.json, /data/c/train.json,
                 /data/d/train.json, /data/e/train.json]
-    repeat_factors: [1, 2, 1, 3, 1]
+    repeat_factors: [1, 1, 1, 1, 1]
 ```
 
-The example above presents dataset B twice and dataset D three times per
-combined epoch. Keep `repeat_factors: [1, 1, 1, 1, 1]` for natural concatenation.
+The ratios are normalized, so they may also be written as decimal weights.
+Sampling within each source dataset is with replacement. Keep
+`repeat_factors: [1, 1, 1, 1, 1]` because the sampler controls balancing.
 Use one stable validation dataset in `val_dataloader` so metrics remain directly
 comparable between epochs.
 

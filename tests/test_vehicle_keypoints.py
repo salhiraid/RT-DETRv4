@@ -4,6 +4,7 @@ from PIL import Image
 
 from engine.data.dataset.coco_dataset import ConvertCocoPolysToMask
 from engine.data.dataset.coco_dataset import MultiCocoDetection
+from engine.data.dataloader import MultiDataSampler
 from engine.data.dataset.vehicle_keypoint_metric import VehicleKeypointMetric
 from engine.rtv4.dfine_decoder import MLP, TransformerDecoder
 from engine.rtv4.postprocessor import PostProcessor
@@ -153,3 +154,12 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
     assert target['boxes'].shape == (1, 4)
     assert target['keypoints'].shape == (1, 31, 2)
     assert target['ignore_keypoints'].item()
+
+    sampler = MultiDataSampler(dataset, dataset_ratio=[25, 75],
+                               max_samples=2000, seed=7)
+    sampled_dataset_ids = [dataset.index_map[index][0] for index in sampler]
+    fraction_second = sum(x == 1 for x in sampled_dataset_ids) / len(sampled_dataset_ids)
+    assert 0.70 < fraction_second < 0.80
+    first_epoch = list(iter(sampler))
+    sampler.set_epoch(1)
+    assert first_epoch != list(iter(sampler))

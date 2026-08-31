@@ -5,6 +5,11 @@ __include__: [
 # Five training datasets are concatenated before the shared keypoint pipeline.
 # All five JSON files must use identical categories and 31-keypoint semantics.
 train_dataloader:
+  shuffle: False  # a sampler and shuffle=True are mutually exclusive
+  sampler:
+    type: MultiDataSampler
+    dataset_ratio: [25, 35, 15, 15, 10]
+    max_samples: 300000
   dataset:
     type: MultiCocoDetection
     img_folders:
@@ -20,8 +25,7 @@ train_dataloader:
       - /absolute/path/to/dataset_4/annotations/train.json
       - /absolute/path/to/dataset_5/annotations/train.json
 
-    # Natural sampling is proportional to dataset size. Increase an integer to
-    # oversample a smaller dataset (for equal-sized datasets, [1,1,1,1,1]).
+    # Keep these at one when MultiDataSampler controls the sampling ratio.
     repeat_factors: [1, 1, 1, 1, 1]
 
 # Evaluation intentionally uses one stable validation set. Change these two paths

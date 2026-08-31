@@ -29,13 +29,63 @@ __all__ = [
     'DataLoader',
     'BaseCollateFunction',
     'BatchImageCollateFunction',
-    'batch_image_collate_fn'
+    'batch_image_collate_fn',
+    'MultiDataSampler',
 ]
 
 
 @register()
+class MultiDataSampler(data.Sampler):
+    """Sample concatenated datasets according to explicit percentage ratios."""
+    def __init__(self, dataset, dataset_ratio, max_samples, seed=0):
+        if not hasattr(dataset, 'index_map'):
+            raise TypeError('MultiDataSampler requires MultiCocoDetection')
+        if len(dataset_ratio) != len(dataset.datasets):
+            raise ValueError('dataset_ratio must have one value per dataset')
+        ratios = torch.as_tensor(dataset_ratio, dtype=torch.float64)
+        if (ratios < 0).any() or ratios.sum() <= 0:
+            raise ValueError('dataset_ratio must be non-negative with a positive sum')
+        if max_samples <= 0:
+            raise ValueError('max_samples must be positive')
+        self.dataset, self.ratios = dataset, ratios / ratios.sum()
+        self.max_samples, self.seed, self.epoch = int(max_samples), int(seed), 0
+        self.indices_by_dataset = []
+        for dataset_index in range(len(dataset.datasets)):
+            indices = [index for index, pair in enumerate(dataset.index_map)
+                       if pair[0] == dataset_index]
+            if not indices:
+                raise ValueError(f'Dataset {dataset_index} has no samples')
+            self.indices_by_dataset.append(torch.as_tensor(indices, dtype=torch.long))
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _distributed_info(self):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_world_size(), torch.distributed.get_rank()
+        return 1, 0
+
+    def __iter__(self):
+        world_size, rank = self._distributed_info()
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        total = ((self.max_samples + world_size - 1) // world_size) * world_size
+        choices = torch.multinomial(self.ratios, total, replacement=True,
+                                    generator=generator)
+        sampled = torch.empty(total, dtype=torch.long)
+        for dataset_index, pool in enumerate(self.indices_by_dataset):
+            positions = torch.where(choices == dataset_index)[0]
+            offsets = torch.randint(len(pool), (len(positions),), generator=generator)
+            sampled[positions] = pool[offsets]
+        return iter(sampled[rank:total:world_size].tolist())
+
+    def __len__(self):
+        world_size, _ = self._distributed_info()
+        return (self.max_samples + world_size - 1) // world_size
+
+
+@register()
 class DataLoader(data.DataLoader):
-    __inject__ = ['dataset', 'collate_fn']
+    __inject__ = ['dataset', 'collate_fn', 'sampler']
 
     def __repr__(self) -> str:
         format_string = self.__class__.__name__ + "("
@@ -49,6 +99,8 @@ class DataLoader(data.DataLoader):
         self._epoch = epoch
         self.dataset.set_epoch(epoch)
         self.collate_fn.set_epoch(epoch)
+        if hasattr(self.sampler, 'set_epoch'):
+            self.sampler.set_epoch(epoch)
 
     @property
     def epoch(self):

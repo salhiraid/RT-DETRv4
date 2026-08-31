@@ -208,6 +208,33 @@ class YAMLConfig(BaseConfig):
         if 'total_batch_size' in global_cfg[name]:
             # pop unexpected key for dataloader init
             _ = global_cfg[name].pop('total_batch_size')
+        sampler_cfg = global_cfg[name].get('sampler')
+        if isinstance(sampler_cfg, dict):
+            dataset_cfg = global_cfg[name]['dataset']
+            dataset_type = dataset_cfg.get('type', dataset_cfg.get('_name'))
+            dataset_alias = f'__{name}_dataset'
+            global_cfg[dataset_alias] = {
+                'type': dataset_type,
+                **{
+                key: value for key, value in dataset_cfg.items()
+                if not key.startswith('_') and key != 'type'
+                }
+            }
+            dataset = create(dataset_alias, global_cfg)
+            sampler_type = sampler_cfg['type']
+            sampler_alias = f'__{name}_sampler'
+            global_cfg[sampler_alias] = {
+                'type': sampler_type,
+                'dataset': dataset,
+                **{
+                    key: value for key, value in sampler_cfg.items()
+                    if not key.startswith('_') and key != 'type'
+                }
+            }
+            sampler = create(sampler_alias, global_cfg)
+            global_cfg[name]['dataset'] = dataset
+            global_cfg[name]['sampler'] = sampler
+            global_cfg[name]['shuffle'] = False
         print(f'building {name} with batch_size={bs}...')
         loader = create(name, global_cfg, batch_size=bs)
         loader.shuffle = self.yaml_cfg[name].get('shuffle', False)
