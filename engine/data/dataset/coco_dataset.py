@@ -21,21 +21,21 @@ torchvision.disable_beta_transforms_warning()
 faster_coco_eval.init_as_pycocotools()
 Image.MAX_IMAGE_PIXELS = None
 
-__all__ = ['CocoDetection', 'MultiCocoDetection']
+__all__ = ['CocoDetection', 'MultiCocoDetection', 'WeightedMultiDataset']
 NUM_KEYPOINTS = 31
 
 
 @register()
 class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     __inject__ = ['transforms', ]
-    __share__ = ['remap_mscoco_category', 'class_names']
+    __share__ = ['remap_mscoco_category', 'class_names', 'num_keypoints']
 
     def __init__(self, img_folder, ann_file, transforms, return_masks=False,
                  remap_mscoco_category=False, class_names=None,
-                 filter_unknown_categories=True):
+                 filter_unknown_categories=True, num_keypoints=NUM_KEYPOINTS):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
-        self.prepare = ConvertCocoPolysToMask(return_masks)
+        self.prepare = ConvertCocoPolysToMask(return_masks, num_keypoints)
         self.img_folder = img_folder
         self.ann_file = ann_file
         self.return_masks = return_masks
@@ -182,6 +182,76 @@ class MultiCocoDetection(DetDataset):
         return self.datasets[0].categories
 
 
+@register()
+class WeightedMultiDataset(DetDataset):
+    """Sample child datasets with fixed probabilities for a virtual epoch.
+
+    The mapping is rebuilt deterministically by :meth:`set_epoch`. Child
+    datasets deliberately receive their own configuration (normally
+    ``transforms: null``); the shared augmentation pipeline belongs here so
+    Mosaic and similar transforms can sample through this wrapper.
+    """
+    __inject__ = ['datasets', 'transforms']
+
+    def __init__(self, datasets, weights, samples_per_epoch, seed=0,
+                 transforms=None):
+        if not datasets:
+            raise ValueError('WeightedMultiDataset requires at least one dataset')
+        if len(weights) != len(datasets):
+            raise ValueError('weights must contain one value per dataset')
+        probabilities = torch.as_tensor(weights, dtype=torch.float64)
+        if not torch.isfinite(probabilities).all() or (probabilities < 0).any():
+            raise ValueError('weights must be finite and non-negative')
+        if probabilities.sum() <= 0:
+            raise ValueError('weights must have a positive sum')
+        if int(samples_per_epoch) != samples_per_epoch or samples_per_epoch <= 0:
+            raise ValueError('samples_per_epoch must be a positive integer')
+        if any(len(dataset) == 0 for dataset in datasets):
+            raise ValueError('WeightedMultiDataset does not support empty datasets')
+
+        self.datasets = list(datasets)
+        self.weights = probabilities / probabilities.sum()
+        self.samples_per_epoch = int(samples_per_epoch)
+        self.seed = int(seed)
+        self._transforms = transforms
+        self.set_epoch(0)
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def set_epoch(self, epoch):
+        super().set_epoch(epoch)
+        generator = torch.Generator().manual_seed(self.seed + int(epoch))
+        choices = torch.multinomial(
+            self.weights, self.samples_per_epoch, replacement=True,
+            generator=generator)
+        self.index_map = []
+        for dataset_index in choices.tolist():
+            sample_index = torch.randint(
+                len(self.datasets[dataset_index]), (1,), generator=generator).item()
+            self.index_map.append((dataset_index, sample_index))
+        for dataset in self.datasets:
+            if hasattr(dataset, 'set_epoch'):
+                dataset.set_epoch(epoch)
+
+    def load_item(self, index):
+        dataset_index, sample_index = self.index_map[index]
+        dataset = self.datasets[dataset_index]
+        if hasattr(dataset, 'load_item'):
+            return dataset.load_item(sample_index)
+        return dataset[sample_index]
+
+    def __getitem__(self, index):
+        image, target = self.load_item(index)
+        if self._transforms is not None:
+            image, target, _ = self._transforms(image, target, self)
+        return image, target
+
+    @property
+    def categories(self):
+        return self.datasets[0].categories
+
+
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
     for polygons in segmentations:
@@ -200,8 +270,9 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 class ConvertCocoPolysToMask(object):
-    def __init__(self, return_masks=False):
+    def __init__(self, return_masks=False, num_keypoints=NUM_KEYPOINTS):
         self.return_masks = return_masks
+        self.num_keypoints = num_keypoints
 
     def __call__(self, image: Image.Image, target, **kwargs):
         w, h = image.size
@@ -245,18 +316,20 @@ class ConvertCocoPolysToMask(object):
             raw = obj.get('keypoints')
             if raw:
                 kp = torch.as_tensor(raw, dtype=torch.float32).reshape(-1, 3)
-                if kp.shape[0] != NUM_KEYPOINTS:
-                    raise ValueError(f'Expected {NUM_KEYPOINTS} keypoints, got {kp.shape[0]}')
+                if kp.shape[0] != self.num_keypoints:
+                    raise ValueError(
+                        f'Expected {self.num_keypoints} keypoints, got {kp.shape[0]}')
                 keypoints.append(kp[:, :2])
                 keypoints_visible.append(kp[:, 2])
                 ignore_keypoints.append(False)
             else:
-                keypoints.append(torch.zeros(NUM_KEYPOINTS, 2))
-                keypoints_visible.append(torch.zeros(NUM_KEYPOINTS))
+                keypoints.append(torch.zeros(self.num_keypoints, 2))
+                keypoints_visible.append(torch.zeros(self.num_keypoints))
                 ignore_keypoints.append(True)
-        keypoints = torch.stack(keypoints) if keypoints else torch.zeros(0, NUM_KEYPOINTS, 2)
+        keypoints = (torch.stack(keypoints) if keypoints else
+                     torch.zeros(0, self.num_keypoints, 2))
         keypoints_visible = (torch.stack(keypoints_visible) if keypoints_visible else
-                             torch.zeros(0, NUM_KEYPOINTS))
+                             torch.zeros(0, self.num_keypoints))
         ignore_keypoints = torch.tensor(ignore_keypoints, dtype=torch.bool)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])

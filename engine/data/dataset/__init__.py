@@ -4,7 +4,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 # from ._dataset import DetDataset
-from .coco_dataset import CocoDetection, MultiCocoDetection
+from .coco_dataset import CocoDetection, MultiCocoDetection, WeightedMultiDataset
 from .coco_dataset import (
     mscoco_category2name,
     mscoco_category2label,

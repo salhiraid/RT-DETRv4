@@ -4,6 +4,7 @@ from PIL import Image
 
 from engine.data.dataset.coco_dataset import ConvertCocoPolysToMask
 from engine.data.dataset.coco_dataset import MultiCocoDetection
+from engine.data.dataset.coco_dataset import WeightedMultiDataset
 from engine.data.dataloader import MultiDataSampler
 from engine.data.dataset.vehicle_keypoint_metric import VehicleKeypointMetric
 from engine.data.dataset.coco_eval import VehicleCocoEvaluator
@@ -246,6 +247,53 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
     first_epoch = list(iter(sampler))
     sampler.set_epoch(1)
     assert first_epoch != list(iter(sampler))
+
+
+def test_weighted_multi_dataset_uses_nested_coco_configs(tmp_path):
+    from engine.core.workspace import create
+    from engine.core.yaml_utils import merge_config
+
+    dataset_configs = []
+    for dataset_index in range(2):
+        folder = tmp_path / f'weighted_images_{dataset_index}'
+        folder.mkdir()
+        Image.new('RGB', (32, 16)).save(folder / 'sample.jpg')
+        annotation_file = tmp_path / f'weighted_{dataset_index}.json'
+        annotation_file.write_text(json.dumps({
+            'images': [{'id': 1, 'file_name': 'sample.jpg',
+                        'width': 32, 'height': 16}],
+            'annotations': [{'id': 1, 'image_id': 1, 'category_id': 1,
+                             'bbox': [1, 1, 10, 8], 'area': 80,
+                             'iscrowd': 0}],
+            'categories': [{'id': 1, 'name': 'vehicle'}],
+        }))
+        dataset_configs.append({
+            'type': 'CocoDetection', 'img_folder': str(folder),
+            'ann_file': str(annotation_file), 'transforms': None,
+            'return_masks': False, 'remap_mscoco_category': False,
+            'num_keypoints': 31,
+        })
+
+    config = merge_config({
+        'weighted_test_dataset': {
+            'type': 'WeightedMultiDataset', 'datasets': dataset_configs,
+            'weights': [0.7, 0.3], 'samples_per_epoch': 1000, 'seed': 42,
+            'transforms': None,
+        }
+    })
+    dataset = create('weighted_test_dataset', config)
+
+    assert isinstance(dataset, WeightedMultiDataset)
+    assert all(dataset._transforms is None for dataset in dataset.datasets)
+    assert len(dataset) == 1000
+    selected = [dataset_index for dataset_index, _ in dataset.index_map]
+    assert 0.65 < selected.count(0) / len(selected) < 0.75
+    first_epoch = list(dataset.index_map)
+    dataset.set_epoch(1)
+    assert first_epoch != dataset.index_map
+    image, target = dataset[0]
+    assert image.size == (32, 16)
+    assert target['keypoints'].shape == (1, 31, 2)
 
 
 def test_dinov3_teacher_validates_paths_and_supports_rectangular_grid(tmp_path, monkeypatch):

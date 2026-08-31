@@ -166,6 +166,20 @@ def create(type_or_name, global_cfg=GLOBAL_CONFIG, **kwargs):
             name = _cfg.pop('type') # pop extra key (`type` from _k)
             module_kwargs[k] = create(name, global_cfg)
 
+        elif isinstance(_k, (list, tuple)):
+            dependencies = []
+            for index, item in enumerate(_k):
+                if not isinstance(item, dict) or 'type' not in item:
+                    raise ValueError(
+                        f'Injected list `{k}` item {index} must be a type config.')
+                item_type = str(item['type'])
+                if item_type not in global_cfg:
+                    raise ValueError(f'Missing {item_type} in inspect stage.')
+                alias = f'__injected_{k}_{index}_{item_type}'
+                global_cfg[alias] = dict(item)
+                dependencies.append(create(alias, global_cfg))
+            module_kwargs[k] = dependencies
+
         else:
             # Already-built dependencies are used by composite dataloaders and
             # samplers that must share the exact same dataset instance.
