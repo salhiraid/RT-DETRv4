@@ -393,10 +393,12 @@ class TransformerDecoder(nn.Module):
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
                 if keypoint_xy_head is not None:
-                    keypoint_logits = keypoint_xy_head[i](output)
+                    # A single pose branch is shared by every decoder layer;
+                    # decoder activations remain layer-specific.
+                    keypoint_logits = keypoint_xy_head[0](output)
                     keypoints_xy = self._decode_keypoints_inside_bbox(
                         keypoint_logits, inter_ref_bbox)
-                    keypoints_vis = keypoint_vis_head[i](output)
+                    keypoints_vis = keypoint_vis_head[0](output)
                     if keypoints_xy.shape[:2] != inter_ref_bbox.shape[:2]:
                         raise RuntimeError('Keypoint and bbox queries are not aligned')
                     dec_out_keypoints_xy.append(keypoints_xy)
@@ -473,6 +475,7 @@ class DFINETransformer(nn.Module):
                  layer_scale=1,
                  mlp_act='relu',
                  which_keypoints=None,
+                 num_reg_fcs=2,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -494,6 +497,7 @@ class DFINETransformer(nn.Module):
         self.aux_loss = aux_loss
         self.which_keypoints = list(which_keypoints or [])
         self.use_keypoints = bool(self.which_keypoints)
+        self.num_reg_fcs = num_reg_fcs
         self.reg_max = reg_max
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
@@ -554,14 +558,22 @@ class DFINETransformer(nn.Module):
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
         if self.use_keypoints:
-            def kpt_branch(dim, channels):
-                return MLP(dim, dim, channels, 5, act=mlp_act)
-            self.kps_xy_branches = nn.ModuleList(
-                [kpt_branch(hidden_dim if i <= self.eval_idx else scaled_dim,
-                            2 * len(self.which_keypoints)) for i in range(num_layers)])
-            self.kps_vis_branches = nn.ModuleList(
-                [kpt_branch(hidden_dim if i <= self.eval_idx else scaled_dim,
-                            len(self.which_keypoints)) for i in range(num_layers)])
+            if scaled_dim != hidden_dim:
+                raise ValueError(
+                    'Shared keypoint heads require layer_scale=1; got '
+                    f'hidden_dim={hidden_dim}, scaled_dim={scaled_dim}.')
+
+            def kpt_branch(embed_dims, out_channels):
+                layers = []
+                for _ in range(self.num_reg_fcs * 2):
+                    layers.extend((nn.Linear(embed_dims, embed_dims), nn.ReLU()))
+                layers.append(nn.Linear(embed_dims, out_channels))
+                return nn.Sequential(*layers)
+
+            self.kps_xy_branches = nn.ModuleList([
+                kpt_branch(hidden_dim, 2 * len(self.which_keypoints))])
+            self.kps_vis_branches = nn.ModuleList([
+                kpt_branch(hidden_dim, len(self.which_keypoints))])
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:

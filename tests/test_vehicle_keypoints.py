@@ -7,7 +7,7 @@ from engine.data.dataset.coco_dataset import MultiCocoDetection
 from engine.data.dataloader import MultiDataSampler
 from engine.data.dataset.vehicle_keypoint_metric import VehicleKeypointMetric
 from engine.data.dataset.coco_eval import VehicleCocoEvaluator
-from engine.rtv4.dfine_decoder import MLP, TransformerDecoder
+from engine.rtv4.dfine_decoder import DFINETransformer, MLP, TransformerDecoder
 from engine.rtv4.postprocessor import PostProcessor
 from engine.rtv4.rtv4_criterion import RTv4Criterion
 
@@ -42,6 +42,34 @@ def test_bbox_local_decode_shapes_geometry_and_backward():
     assert boxes.grad is None
     assert branch_xy.layers[-1].weight.grad.abs().sum() > 0
     assert branch_vis.layers[-1].weight.grad.abs().sum() > 0
+
+
+def test_keypoint_heads_are_shared_deep_branches():
+    model = DFINETransformer(
+        num_classes=1, hidden_dim=16, num_queries=10,
+        feat_channels=[16, 16, 16], num_layers=3,
+        dim_feedforward=32, nhead=4, which_keypoints=list(range(31)),
+        num_reg_fcs=2)
+
+    assert len(model.kps_xy_branches) == len(model.kps_vis_branches) == 1
+    xy_layers = list(model.kps_xy_branches[0])
+    vis_layers = list(model.kps_vis_branches[0])
+    assert len([layer for layer in xy_layers if isinstance(layer, torch.nn.Linear)]) == 5
+    assert len([layer for layer in xy_layers if isinstance(layer, torch.nn.ReLU)]) == 4
+    assert xy_layers[-1].out_features == 62
+    assert vis_layers[-1].out_features == 31
+
+
+def test_keypoint_parameter_count_is_independent_of_evaluation_resolution():
+    kwargs = dict(
+        num_classes=1, hidden_dim=16, num_queries=10,
+        feat_channels=[16, 16, 16], num_layers=3,
+        dim_feedforward=32, nhead=4, which_keypoints=list(range(31)))
+    small = DFINETransformer(eval_spatial_size=[400, 400], **kwargs)
+    large = DFINETransformer(eval_spatial_size=[672, 1184], **kwargs)
+
+    count = lambda model: sum(parameter.numel() for parameter in model.parameters())
+    assert count(small) == count(large)
 
 
 class Matcher:
