@@ -6,6 +6,7 @@ from engine.data.dataset.coco_dataset import ConvertCocoPolysToMask
 from engine.data.dataset.coco_dataset import MultiCocoDetection
 from engine.data.dataloader import MultiDataSampler
 from engine.data.dataset.vehicle_keypoint_metric import VehicleKeypointMetric
+from engine.data.dataset.coco_eval import VehicleCocoEvaluator
 from engine.rtv4.dfine_decoder import MLP, TransformerDecoder
 from engine.rtv4.postprocessor import PostProcessor
 from engine.rtv4.rtv4_criterion import RTv4Criterion
@@ -139,10 +140,18 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
         annotation = {
             'images': [{'id': dataset_index + 1, 'file_name': 'sample.jpg',
                         'width': 32, 'height': 16}],
-            'annotations': [{'id': dataset_index + 1, 'image_id': dataset_index + 1,
-                             'category_id': 10 + dataset_index, 'bbox': [1, 1, 10, 8],
-                             'area': 80, 'iscrowd': 0}],
-            'categories': [{'id': 10 + dataset_index, 'name': 'vehicle'}],
+            'annotations': [
+                {'id': dataset_index + 1, 'image_id': dataset_index + 1,
+                 'category_id': 10 + dataset_index, 'bbox': [1, 1, 10, 8],
+                 'area': 80, 'iscrowd': 0},
+                {'id': 100 + dataset_index, 'image_id': dataset_index + 1,
+                 'category_id': 0, 'bbox': [15, 1, 8, 8],
+                 'area': 64, 'iscrowd': 0},
+            ],
+            'categories': [
+                {'id': 0, 'name': 'person'},
+                {'id': 10 + dataset_index, 'name': 'vehicle'},
+            ],
         }
         annotation_file = tmp_path / f'dataset_{dataset_index}.json'
         annotation_file.write_text(json.dumps(annotation))
@@ -156,6 +165,9 @@ def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
     assert target['keypoints'].shape == (1, 31, 2)
     assert target['ignore_keypoints'].item()
     assert target['labels'].item() == 0
+    evaluator = VehicleCocoEvaluator(
+        dataset.datasets[0].coco, class_names=['vehicle'])
+    assert evaluator.coco_eval['bbox'].params.catIds == [10]
 
     sampler = MultiDataSampler(dataset, dataset_ratio=[25, 75],
                                max_samples=2000, seed=7)

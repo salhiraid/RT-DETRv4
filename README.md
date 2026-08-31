@@ -288,9 +288,11 @@ Sampling within each source dataset is with replacement. Keep
 Use one stable validation dataset in `val_dataloader` so metrics remain directly
 comparable between epochs.
 
-Set `class_names` to the exact five strings used in the JSON `categories[*].name`
-fields. A source dataset may omit a class, but it must not introduce an unknown
-name. COCO annotation record ids (`annotations[*].id`) should start at 1; an
+Set `class_names` to the exact five vehicle strings used in the JSON
+`categories[*].name` fields. A source dataset may omit a configured class.
+Annotations belonging to other categories, such as `person`, are filtered out
+like MMDetection's selected-class COCO loading. COCO annotation record ids
+(`annotations[*].id`) should start at 1; an
 annotation id of 0 is reserved as an unmatched marker by COCO evaluation.
 
 ```shell

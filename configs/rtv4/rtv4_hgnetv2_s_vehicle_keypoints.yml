@@ -10,11 +10,12 @@ eval_spatial_size: [666, 1184]
 
 # -----------------------------------------------------------------------------
 # EDIT ONLY THIS DATASET SECTION FOR YOUR COCO-FORMAT VEHICLE DATASET.
-# category_id values must be contiguous and zero-based: 0 .. num_classes - 1.
+# category_id values may be sparse; they are remapped by canonical class name.
 # Each annotated object may contain 31 x (x, y, visibility) values in keypoints.
 # Objects without a keypoints field remain valid bbox-only training instances.
 # -----------------------------------------------------------------------------
-num_classes: 1
+num_classes: 5
+class_names: &vehicle_classes [bicycle, car, motorcycle, bus, truck]
 remap_mscoco_category: False
 
 DFINETransformer:
@@ -79,3 +80,4 @@ evaluator:
   margin: 0.05
   crop_size: 512
   min_bbox_size: 64.0
+  class_names: *vehicle_classes

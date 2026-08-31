@@ -31,7 +31,8 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     __share__ = ['remap_mscoco_category', 'class_names']
 
     def __init__(self, img_folder, ann_file, transforms, return_masks=False,
-                 remap_mscoco_category=False, class_names=None):
+                 remap_mscoco_category=False, class_names=None,
+                 filter_unknown_categories=True):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
@@ -40,11 +41,12 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         self.return_masks = return_masks
         self.remap_mscoco_category = remap_mscoco_category
         self.class_names = list(class_names) if class_names is not None else None
+        self.filter_unknown_categories = filter_unknown_categories
         if self.class_names is not None:
             if len(set(self.class_names)) != len(self.class_names):
                 raise ValueError('class_names must not contain duplicates')
             unknown = set(self.category2name.values()) - set(self.class_names)
-            if unknown:
+            if unknown and not self.filter_unknown_categories:
                 raise ValueError(
                     f'{ann_file} contains categories absent from class_names: '
                     f'{sorted(unknown)}')
@@ -65,6 +67,7 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
             category2label = {
                 category_id: name_to_label[name]
                 for category_id, name in self.category2name.items()
+                if name in name_to_label
             }
             image, target = self.prepare(image, target, category2label=category2label)
         elif self.remap_mscoco_category:
@@ -125,6 +128,7 @@ class MultiCocoDetection(DetDataset):
     def __init__(self, img_folders, ann_files, transforms,
                  repeat_factors=None, return_masks=False,
                  remap_mscoco_category=False, class_names=None,
+                 filter_unknown_categories=True,
                  img_folder=None, ann_file=None):
         if len(img_folders) != len(ann_files):
             raise ValueError('img_folders and ann_files must have the same length')
@@ -138,7 +142,8 @@ class MultiCocoDetection(DetDataset):
             CocoDetection(folder, annotation, transforms=None,
                           return_masks=return_masks,
                           remap_mscoco_category=remap_mscoco_category,
-                          class_names=class_names)
+                          class_names=class_names,
+                          filter_unknown_categories=filter_unknown_categories)
             for folder, annotation in zip(img_folders, ann_files)
         ]
         self.class_names = list(class_names) if class_names is not None else None
@@ -208,6 +213,13 @@ class ConvertCocoPolysToMask(object):
 
         anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
 
+        category2label = kwargs.get('category2label', None)
+        if category2label is not None:
+            # Match MMDetection semantics: annotations whose category is not in
+            # the configured class subset (for example `person` in a vehicle
+            # task) are ignored rather than treated as a configuration error.
+            anno = [obj for obj in anno if obj['category_id'] in category2label]
+
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
@@ -215,7 +227,6 @@ class ConvertCocoPolysToMask(object):
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        category2label = kwargs.get('category2label', None)
         if category2label is not None:
             labels = [category2label[obj["category_id"]] for obj in anno]
         else:

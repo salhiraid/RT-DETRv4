@@ -8,10 +8,10 @@ teacher_model:
   dinov3_repo_path: ./dinov3
   dinov3_weights_path: ./pretrain/dinov3_vitb16_pretrain_lvd1689m.pth
 
-# EDIT these five names so they exactly match the `name` fields in every JSON's
-# categories list. Local category ids may differ; they are remapped by name.
+# Canonical five-class vehicle subset. `person` and any other categories in a
+# source JSON are filtered out. Local category ids may differ and are remapped.
 num_classes: 5
-class_names: &vehicle_classes [class_0, class_1, class_2, class_3, class_4]
+class_names: &vehicle_classes [bicycle, car, motorcycle, bus, truck]
 
 # Five training datasets are concatenated before the shared keypoint pipeline.
 # Category ids/order may differ, but names and 31-keypoint semantics must agree.

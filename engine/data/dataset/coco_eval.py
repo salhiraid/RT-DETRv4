@@ -223,6 +223,7 @@ class VehicleCocoEvaluator(CocoEvaluator):
                 index: name_to_category[name]
                 for index, name in enumerate(self.class_names)
             }
+            self._configure_category_filter()
         from .vehicle_keypoint_metric import VehicleKeypointMetric
         self.vehicle_metric = VehicleKeypointMetric(
             num_keypoints, thresholds, iou_thr, vis_thr, score_thr,
@@ -231,8 +232,16 @@ class VehicleCocoEvaluator(CocoEvaluator):
 
     def cleanup(self):
         super().cleanup()
+        self._configure_category_filter()
         self.vehicle_metric.results.clear()
         self.vehicle_metrics = {}
+
+    def _configure_category_filter(self):
+        if self.label2category is None:
+            return
+        category_ids = list(self.label2category.values())
+        for coco_eval in self.coco_eval.values():
+            coco_eval.params.catIds = category_ids
 
     def update(self, predictions):
         if self.label2category is not None:
@@ -249,8 +258,13 @@ class VehicleCocoEvaluator(CocoEvaluator):
         super().update(predictions)
         samples = []
         for image_id, pred in predictions.items():
-            annotations = [ann for ann in self.coco_gt.imgToAnns.get(image_id, [])
-                           if not ann.get('iscrowd', 0)]
+            allowed_categories = (set(self.label2category.values())
+                                  if self.label2category is not None else None)
+            annotations = [
+                ann for ann in self.coco_gt.imgToAnns.get(image_id, [])
+                if not ann.get('iscrowd', 0) and
+                (allowed_categories is None or ann['category_id'] in allowed_categories)
+            ]
             boxes, labels, keypoints, visibility = [], [], [], []
             for ann in annotations:
                 x, y, w, h = ann['bbox']
