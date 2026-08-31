@@ -137,7 +137,7 @@ class YAMLConfig(BaseConfig):
     @property
     def evaluator(self, ):
         if self._evaluator is None and 'evaluator' in self.yaml_cfg:
-            if self.yaml_cfg['evaluator']['type'] == 'CocoEvaluator':
+            if self.yaml_cfg['evaluator']['type'] in ('CocoEvaluator', 'VehicleCocoEvaluator'):
                 from ..data import get_coco_api_from_dataset
                 base_ds = get_coco_api_from_dataset(self.val_dataloader.dataset)
                 self._evaluator = create('evaluator', self.global_cfg, coco_gt=base_ds)
