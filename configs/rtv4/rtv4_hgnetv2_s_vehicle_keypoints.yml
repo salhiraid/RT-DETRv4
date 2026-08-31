@@ -18,15 +18,13 @@ num_classes: 5
 class_names: &vehicle_classes [bicycle, car, motorcycle, bus, truck]
 remap_mscoco_category: False
 
-# Match objects exclusively by bounding-box geometry. Keypoint predictions,
-# visibility, and classification confidence cannot change the assignment.
-HungarianMatcher:
-  weight_dict: {cost_class: 0, cost_bbox: 5, cost_giou: 2}
-
 DFINETransformer:
   which_keypoints: *vehicle_keypoints
 
 RTv4Criterion:
+  # Override the matcher injected into this criterion.
+  matcher:
+    weight_dict: {cost_class: 0, cost_bbox: 5, cost_giou: 2}
   which_keypoints: *vehicle_keypoints
   losses: ['mal', 'boxes', 'local', 'distill', 'keypoints']
   loss_keypoints_xy_weight: 10.0

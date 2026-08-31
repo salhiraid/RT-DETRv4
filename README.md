@@ -243,6 +243,15 @@ predicted keypoint coordinates, keypoint visibility, and keypoint annotations do
 not affect which query is paired with which target. Keypoint losses are computed
 only after this box-only assignment.
 
+If every keypoint loss is exactly zero, inspect the annotations rather than the
+ordering of the five datasets. `MultiDataSampler` draws a dataset independently
+for every sample, so pose and bbox-only datasets are interleaved. A batch has
+zero pose loss when none of its matched objects has a non-ignored keypoint with
+visibility greater than zero. Training emits a warning after 100 consecutive
+such batches; this usually means the sampled COCO annotations have no
+`keypoints`, contain only zero visibility values, or pose-bearing categories were
+filtered by `class_names`.
+
 Train:
 
 ```shell

@@ -74,6 +74,17 @@ def test_bbox_only_and_mixed_pose_loss():
     assert losses['loss_keypoints_xy'] > 0 and outputs['pred_keypoints'].grad.abs().sum() > 0
 
 
+def test_target_pose_diagnostic_requires_visible_nonignored_instance():
+    target = {
+        'keypoints_visible': torch.zeros(2, 31),
+        'ignore_keypoints': torch.tensor([True, False]),
+    }
+    target['keypoints_visible'][0].fill_(2)
+    assert not RTv4Criterion._target_has_pose(target)
+    target['keypoints_visible'][1, 0] = 1
+    assert RTv4Criterion._target_has_pose(target)
+
+
 def test_inference_alignment_and_metric_contract():
     outputs = dict(pred_logits=torch.tensor([[[8.], [7.], [6.]]]),
                    pred_boxes=torch.rand(1, 3, 4), pred_keypoints=torch.rand(1, 3, 62),
