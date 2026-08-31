@@ -49,6 +49,8 @@ class PostProcessor(nn.Module):
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
         logits, boxes = outputs['pred_logits'], outputs['pred_boxes']
+        keypoints_xy = outputs.get('pred_keypoints')
+        keypoints_vis = outputs.get('pred_keypoints_vis')
         # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')
@@ -62,6 +64,11 @@ class PostProcessor(nn.Module):
             labels = mod(index, self.num_classes)
             index = index // self.num_classes
             boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
+            if keypoints_xy is not None:
+                keypoints_xy = keypoints_xy.gather(
+                    1, index.unsqueeze(-1).expand(-1, -1, keypoints_xy.shape[-1]))
+                keypoints_vis = keypoints_vis.gather(
+                    1, index.unsqueeze(-1).expand(-1, -1, keypoints_vis.shape[-1]))
 
         else:
             scores = F.softmax(logits)[:, :, :-1]
@@ -70,6 +77,11 @@ class PostProcessor(nn.Module):
                 scores, index = torch.topk(scores, self.num_top_queries, dim=-1)
                 labels = torch.gather(labels, dim=1, index=index)
                 boxes = torch.gather(boxes, dim=1, index=index.unsqueeze(-1).tile(1, 1, boxes.shape[-1]))
+                if keypoints_xy is not None:
+                    keypoints_xy = torch.gather(
+                        keypoints_xy, 1, index.unsqueeze(-1).expand(-1, -1, keypoints_xy.shape[-1]))
+                    keypoints_vis = torch.gather(
+                        keypoints_vis, 1, index.unsqueeze(-1).expand(-1, -1, keypoints_vis.shape[-1]))
 
         # TODO for onnx export
         if self.deploy_mode:
@@ -84,8 +96,18 @@ class PostProcessor(nn.Module):
             ).reshape(labels.shape)
 
         results = []
-        for lab, box, sco in zip(labels, boxes, scores):
+        kp_iter = (zip(keypoints_xy, keypoints_vis, orig_target_sizes)
+                   if keypoints_xy is not None else [None] * len(labels))
+        for lab, box, sco, kp_data in zip(labels, boxes, scores, kp_iter):
             result = dict(labels=lab, boxes=box, scores=sco)
+            if kp_data is not None:
+                kp_xy, kp_vis, size = kp_data
+                kp_xy = kp_xy.reshape(kp_xy.shape[0], -1, 2).clone()
+                kp_xy *= size.to(kp_xy).view(1, 1, 2)
+                result.update(keypoints_xy=kp_xy, keypoints=kp_xy,
+                              keypoints_vis=kp_vis,
+                              keypoint_scores=kp_vis.sigmoid())
+                assert len(box) == len(kp_xy) == len(kp_vis)
             results.append(result)
 
         return results

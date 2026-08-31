@@ -1,0 +1,50 @@
+__include__: [
+  './rtv4_hgnetv2_s_vehicle_keypoints.yml'
+]
+
+# RT-DETRv4 distillation requires the local DINOv3 repository and checkpoint.
+# `dinov3_repo_path` must be the directory that contains DINOv3's hubconf.py.
+teacher_model:
+  dinov3_repo_path: ./dinov3
+  dinov3_weights_path: ./pretrain/dinov3_vitb16_pretrain_lvd1689m.pth
+
+# EDIT these five names so they exactly match the `name` fields in every JSON's
+# categories list. Local category ids may differ; they are remapped by name.
+num_classes: 5
+class_names: &vehicle_classes [class_0, class_1, class_2, class_3, class_4]
+
+# Five training datasets are concatenated before the shared keypoint pipeline.
+# Category ids/order may differ, but names and 31-keypoint semantics must agree.
+train_dataloader:
+  shuffle: False  # a sampler and shuffle=True are mutually exclusive
+  sampler:
+    type: MultiDataSampler
+    dataset_ratio: [25, 35, 15, 15, 10]
+    max_samples: 300000
+  dataset:
+    type: MultiCocoDetection
+    img_folders:
+      - /absolute/path/to/dataset_1/images/train
+      - /absolute/path/to/dataset_2/images/train
+      - /absolute/path/to/dataset_3/images/train
+      - /absolute/path/to/dataset_4/images/train
+      - /absolute/path/to/dataset_5/images/train
+    ann_files:
+      - /absolute/path/to/dataset_1/annotations/train.json
+      - /absolute/path/to/dataset_2/annotations/train.json
+      - /absolute/path/to/dataset_3/annotations/train.json
+      - /absolute/path/to/dataset_4/annotations/train.json
+      - /absolute/path/to/dataset_5/annotations/train.json
+
+    # Keep these at one when MultiDataSampler controls the sampling ratio.
+    repeat_factors: [1, 1, 1, 1, 1]
+
+# Evaluation intentionally uses one stable validation set. Change these two paths
+# to the validation dataset on which you want bbox/keypoint metrics reported.
+val_dataloader:
+  dataset:
+    img_folder: /absolute/path/to/evaluation_dataset/images/val
+    ann_file: /absolute/path/to/evaluation_dataset/annotations/val.json
+
+evaluator:
+  class_names: *vehicle_classes

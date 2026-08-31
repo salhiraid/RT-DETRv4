@@ -1,0 +1,81 @@
+__include__: [
+  './rtv4_hgnetv2_s_coco.yml'
+]
+
+# DEIM-compatible 31-point vehicle pose task. Set these paths to the vehicle COCO JSON.
+num_keypoints: 31
+which_keypoints: &vehicle_keypoints [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+output_dir: ./outputs/rtv4_hgnetv2_s_vehicle_keypoints
+eval_spatial_size: [666, 1184]
+
+# -----------------------------------------------------------------------------
+# EDIT ONLY THIS DATASET SECTION FOR YOUR COCO-FORMAT VEHICLE DATASET.
+# category_id values must be contiguous and zero-based: 0 .. num_classes - 1.
+# Each annotated object may contain 31 x (x, y, visibility) values in keypoints.
+# Objects without a keypoints field remain valid bbox-only training instances.
+# -----------------------------------------------------------------------------
+num_classes: 1
+remap_mscoco_category: False
+
+DFINETransformer:
+  which_keypoints: *vehicle_keypoints
+
+RTv4Criterion:
+  which_keypoints: *vehicle_keypoints
+  losses: ['mal', 'boxes', 'local', 'distill', 'keypoints']
+  loss_keypoints_xy_weight: 10.0
+  loss_keypoints_vis_weight: 3.0
+  loss_keypoints_oks:
+    type: OKSLoss
+    metainfo: ~  # Set to your custom MMPose vehicle metainfo file to load sigmas/weights.
+    reduction: mean
+    loss_weight: 25.0
+  weight_dict:
+    loss_keypoints_xy: 1.0
+    loss_keypoints_vis: 1.0
+    loss_keypoints_oks: 1.0
+
+train_dataloader:
+  dataset:
+    img_folder: /absolute/path/to/vehicle/images/train
+    ann_file: /absolute/path/to/vehicle/annotations/train.json
+    transforms:
+      ops:
+        - {type: FillKeypoints, num_keypoints: 31}
+        - {type: Mosaic, output_size: 592, max_size: 666, rotation_range: 0, translation_range: [0.0, 0.0], scaling_range: [0.6, 1.4], probability: 0.5, fill_value: 114, use_cache: False}
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [666, 1184]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: float32, scale: True}
+        - {type: ConvertBoxes, fmt: cxcywh, normalize: True}
+  collate_fn:
+    # Keep the configured rectangular H x W geometry. The upstream
+    # scalar multi-scale collate resizes batches to squares and must be disabled.
+    base_size_repeat: ~
+
+val_dataloader:
+  dataset:
+    img_folder: /absolute/path/to/vehicle/images/val
+    ann_file: /absolute/path/to/vehicle/annotations/val.json
+    transforms:
+      ops:
+        - {type: FillKeypoints, num_keypoints: 31}
+        - {type: Resize, size: [666, 1184]}
+        - {type: ConvertPILImage, dtype: float32, scale: True}
+        - {type: ConvertBoxes, fmt: cxcywh, normalize: True}
+
+evaluator:
+  type: VehicleCocoEvaluator
+  iou_types: ['bbox']
+  num_keypoints: 31
+  thresholds: [5.0, 10.0]
+  iou_thr: 0.5
+  vis_thr: 0.5
+  score_thr: 0.05
+  margin: 0.05
+  crop_size: 512
+  min_bbox_size: 64.0
