@@ -254,6 +254,36 @@ torchrun --nproc_per_node=1 train.py \
   --test-only
 ```
 
+#### Training with multiple COCO datasets
+
+For five training datasets, use
+[`configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml`](./configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml).
+Edit the five entries in `img_folders` and `ann_files`. All datasets must use
+the same category definitions and the same 31-keypoint ordering. By default,
+sampling is proportional to each dataset's number of images. Use integer
+`repeat_factors` to oversample smaller datasets:
+
+```yaml
+train_dataloader:
+  dataset:
+    type: MultiCocoDetection
+    img_folders: [/data/a/train, /data/b/train, /data/c/train, /data/d/train, /data/e/train]
+    ann_files: [/data/a/train.json, /data/b/train.json, /data/c/train.json,
+                /data/d/train.json, /data/e/train.json]
+    repeat_factors: [1, 2, 1, 3, 1]
+```
+
+The example above presents dataset B twice and dataset D three times per
+combined epoch. Keep `repeat_factors: [1, 1, 1, 1, 1]` for natural concatenation.
+Use one stable validation dataset in `val_dataloader` so metrics remain directly
+comparable between epochs.
+
+```shell
+torchrun --nproc_per_node=1 train.py \
+  -c configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml \
+  --use-amp
+```
+
 ### Teacher Model Preparation
 
 Our framework uses a pre-trained Vision Foundation Model (VFM) as the teacher. We use the **ViT-B/16-LVD-1689M** model from DINOv3.

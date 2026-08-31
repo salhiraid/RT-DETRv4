@@ -1,7 +1,9 @@
 import torch
+import json
 from PIL import Image
 
 from engine.data.dataset.coco_dataset import ConvertCocoPolysToMask
+from engine.data.dataset.coco_dataset import MultiCocoDetection
 from engine.data.dataset.vehicle_keypoint_metric import VehicleKeypointMetric
 from engine.rtv4.dfine_decoder import MLP, TransformerDecoder
 from engine.rtv4.postprocessor import PostProcessor
@@ -125,3 +127,29 @@ def test_criterion_exposes_oks_for_pose_and_empty_batches():
     assert losses['loss_keypoints_oks'] > 0
     sum(losses.values()).backward()
     assert outputs['pred_keypoints'].grad.abs().sum() > 0
+
+
+def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
+    image_folders, annotation_files = [], []
+    for dataset_index in range(2):
+        folder = tmp_path / f'images_{dataset_index}'
+        folder.mkdir()
+        Image.new('RGB', (32, 16)).save(folder / 'sample.jpg')
+        annotation = {
+            'images': [{'id': dataset_index + 1, 'file_name': 'sample.jpg',
+                        'width': 32, 'height': 16}],
+            'annotations': [{'id': dataset_index + 1, 'image_id': dataset_index + 1,
+                             'category_id': 0, 'bbox': [1, 1, 10, 8],
+                             'area': 80, 'iscrowd': 0}],
+            'categories': [{'id': 0, 'name': 'vehicle'}],
+        }
+        annotation_file = tmp_path / f'dataset_{dataset_index}.json'
+        annotation_file.write_text(json.dumps(annotation))
+        image_folders.append(str(folder)); annotation_files.append(str(annotation_file))
+    dataset = MultiCocoDetection(
+        image_folders, annotation_files, transforms=None, repeat_factors=[1, 2])
+    assert len(dataset) == 3
+    _, target = dataset.load_item(2)
+    assert target['boxes'].shape == (1, 4)
+    assert target['keypoints'].shape == (1, 31, 2)
+    assert target['ignore_keypoints'].item()
