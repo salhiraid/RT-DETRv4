@@ -17,22 +17,98 @@ from typing import Any, Dict, List, Optional
 
 from .._misc import convert_to_tv_tensor, _boxes_keys
 from .._misc import Image, Video, Mask, BoundingBoxes
-from .._misc import SanitizeBoundingBoxes
+from .._misc import SanitizeBoundingBoxes as TVSanitizeBoundingBoxes
 
 from ...core import register
 torchvision.disable_beta_transforms_warning()
 
 
+def _spatial_size(value):
+    getter = F.get_size if hasattr(F, 'get_size') else F.get_spatial_size
+    return getter(value)
+
+
 RandomPhotometricDistort = register()(T.RandomPhotometricDistort)
 RandomZoomOut = register()(T.RandomZoomOut)
-RandomHorizontalFlip = register()(T.RandomHorizontalFlip)
-Resize = register()(T.Resize)
 # ToImageTensor = register()(T.ToImageTensor)
 # ConvertDtype = register()(T.ConvertDtype)
 # PILToTensor = register()(T.PILToTensor)
-SanitizeBoundingBoxes = register(name='SanitizeBoundingBoxes')(SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize)
+
+
+@register(name='SanitizeBoundingBoxes')
+class SanitizeBoundingBoxes(TVSanitizeBoundingBoxes):
+    def forward(self, image, target=None, *extra):
+        if target is None or 'boxes' not in target:
+            return super().forward(image, target, *extra)
+        boxes = target['boxes']
+        xyxy = torchvision.ops.box_convert(boxes.as_subclass(torch.Tensor),
+                                           in_fmt=boxes.format.value.lower(), out_fmt='xyxy')
+        keep = ((xyxy[:, 2] - xyxy[:, 0] >= self.min_size) &
+                (xyxy[:, 3] - xyxy[:, 1] >= self.min_size))
+        pose = {key: target.pop(key) for key in
+                ('keypoints', 'keypoints_visible', 'ignore_keypoints') if key in target}
+        output = super().forward(image, target)
+        image, target = output
+        for key, value in pose.items():
+            target[key] = value[keep]
+        return (image, target, *extra) if extra else (image, target)
+
+
+@register()
+class FillKeypoints(T.Transform):
+    """Enforce aligned 31-point placeholders without removing bbox-only GT."""
+    def __init__(self, num_keypoints=31):
+        super().__init__()
+        self.num_keypoints = num_keypoints
+
+    def forward(self, image, target, *extra):
+        n = len(target.get('boxes', []))
+        if 'keypoints' not in target or target['keypoints'].ndim != 3:
+            target['keypoints'] = torch.zeros(n, self.num_keypoints, 2)
+            target['keypoints_visible'] = torch.zeros(n, self.num_keypoints)
+            target['ignore_keypoints'] = torch.ones(n, dtype=torch.bool)
+        if not (n == len(target['labels']) == len(target['keypoints']) ==
+                len(target['keypoints_visible']) == len(target['ignore_keypoints'])):
+            raise RuntimeError('bbox/keypoint instance fields are not aligned')
+        return (image, target, *extra) if extra else (image, target)
+
+
+@register()
+class Resize(T.Resize):
+    def forward(self, image, target=None, *extra):
+        if target is None:
+            return super().forward(image)
+        old_h, old_w = _spatial_size(image)
+        keypoints = target.pop('keypoints', None)
+        output = super().forward(image, target)
+        image, target = output
+        new_h, new_w = _spatial_size(image)
+        if keypoints is not None:
+            keypoints = keypoints.clone()
+            valid = target['keypoints_visible'] > 0
+            keypoints[..., 0][valid] *= new_w / old_w
+            keypoints[..., 1][valid] *= new_h / old_h
+            target['keypoints'] = keypoints
+        return (image, target, *extra) if extra else (image, target)
+
+
+@register()
+class RandomHorizontalFlip(T.RandomHorizontalFlip):
+    """Flip coordinates only; no semantic permutation is invented."""
+    def forward(self, image, target=None, *extra):
+        if target is None or torch.rand(1) >= self.p:
+            return (image, target, *extra) if target is not None else image
+        width = _spatial_size(image)[1]
+        keypoints = target.pop('keypoints', None)
+        image, target = F.horizontal_flip(image), F.horizontal_flip(target)
+        if keypoints is not None:
+            keypoints = keypoints.clone()
+            valid = target['keypoints_visible'] > 0
+            keypoints[..., 0][valid] = width - keypoints[..., 0][valid]
+            target['keypoints'] = keypoints
+        return (image, target, *extra) if extra else (image, target)
 
 
 @register()
@@ -90,8 +166,29 @@ class RandomIoUCrop(T.RandomIoUCrop):
     def __call__(self, *inputs: Any) -> Any:
         if torch.rand(1) >= self.p:
             return inputs if len(inputs) > 1 else inputs[0]
-
-        return super().forward(*inputs)
+        image, target, *extra = inputs
+        params = self.make_params([image, target['boxes']])
+        if not params:
+            return inputs if len(inputs) > 1 else inputs[0]
+        crop = dict(top=params['top'], left=params['left'],
+                    height=params['height'], width=params['width'])
+        image = F.crop(image, **crop)
+        target['boxes'] = F.crop(target['boxes'], **crop)
+        target['boxes'][~params['is_within_crop_area']] = 0
+        if 'masks' in target:
+            target['masks'] = F.crop(target['masks'], **crop)
+        if 'keypoints' in target:
+            keypoints = target['keypoints'].clone()
+            visible = target['keypoints_visible'].clone()
+            valid = visible > 0
+            keypoints[..., 0][valid] -= params['left']
+            keypoints[..., 1][valid] -= params['top']
+            inside = ((keypoints[..., 0] >= 0) & (keypoints[..., 0] <= params['width']) &
+                      (keypoints[..., 1] >= 0) & (keypoints[..., 1] <= params['height']))
+            visible[~inside] = 0
+            keypoints[~inside] = 0
+            target['keypoints'], target['keypoints_visible'] = keypoints, visible
+        return (image, target, *extra)
 
 
 @register()
@@ -118,6 +215,16 @@ class ConvertBoxes(T.Transform):
             inpt = inpt / torch.tensor(spatial_size[::-1]).tile(2)[None]
 
         return inpt
+
+    def forward(self, image, target=None, *extra):
+        output = super().forward(image, target) if target is not None else super().forward(image)
+        if target is not None and self.normalize and 'keypoints' in output[1]:
+            image, target = output
+            h, w = _spatial_size(image)
+            target['keypoints'] = target['keypoints'] / target['keypoints'].new_tensor([w, h])
+            target['size'] = torch.as_tensor([w, h], device=target['keypoints'].device)
+            output = (image, target)
+        return (*output, *extra) if extra else output
 
 
 @register()
