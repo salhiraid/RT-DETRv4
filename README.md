@@ -237,6 +237,12 @@ The JSON files must use COCO detection format. Each pose annotation must contain
 Annotations without `keypoints` are supported and remain bbox-supervised. Custom
 `category_id` values must be contiguous and zero-based (`0 .. num_classes - 1`).
 
+The vehicle configurations set the Hungarian matcher's classification cost to
+zero. Assignment therefore uses only bounding-box L1 and generalized-IoU costs;
+predicted keypoint coordinates, keypoint visibility, and keypoint annotations do
+not affect which query is paired with which target. Keypoint losses are computed
+only after this box-only assignment.
+
 Train:
 
 ```shell

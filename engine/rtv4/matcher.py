@@ -20,7 +20,13 @@ import numpy as np
 
 @register()
 class HungarianMatcher(nn.Module):
-    """This class computes an assignment between the targets and the predictions of the network
+    """Match predictions using class and bounding-box information only.
+
+    Keypoint coordinates, visibility, and keypoint losses are deliberately not
+    read by this module.  Pose supervision is applied by the criterion *after*
+    the object assignment has been selected.
+
+    This class computes an assignment between the targets and the predictions of the network
 
     For efficiency reasons, the targets don't include the no_object. Because of this, in general,
     there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
@@ -36,6 +42,9 @@ class HungarianMatcher(nn.Module):
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
             cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+
+        Set ``cost_class`` to zero to make assignment depend exclusively on the
+        L1 and generalized-IoU bounding-box costs.
         """
         super().__init__()
         self.cost_class = weight_dict['cost_class']
@@ -100,7 +109,8 @@ class HungarianMatcher(nn.Module):
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
-        # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
+        # No keypoint term is included here. This keeps assignment stable when
+        # keypoint predictions or annotations change.
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         C = C.view(bs, num_queries, -1).cpu()
 

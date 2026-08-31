@@ -85,6 +85,36 @@ def test_inference_alignment_and_metric_contract():
     assert {'precision_5px', 'f1_10px', 'vis_accuracy', 'matched_ratio'} <= values.keys()
 
 
+def test_vehicle_matcher_uses_only_bbox_geometry():
+    from engine.rtv4.matcher import HungarianMatcher
+
+    matcher = HungarianMatcher(
+        {'cost_class': 0, 'cost_bbox': 5, 'cost_giou': 2},
+        use_focal_loss=True)
+    boxes = torch.tensor([[[.2, .2, .1, .1], [.8, .8, .1, .1]]])
+    targets = [{
+        'labels': torch.tensor([0, 1]),
+        'boxes': torch.tensor([[.8, .8, .1, .1], [.2, .2, .1, .1]]),
+        'keypoints': torch.rand(2, 31, 2),
+    }]
+    outputs = {
+        'pred_logits': torch.tensor([[[20., -20.], [-20., 20.]]]),
+        'pred_boxes': boxes,
+        'pred_keypoints': torch.rand(1, 2, 62),
+        'pred_keypoints_vis': torch.rand(1, 2, 31),
+    }
+    first = matcher(outputs, targets)['indices'][0]
+
+    # Reverse class preference and replace every keypoint. Box-only matching
+    # must still pair query 0 -> target 1 and query 1 -> target 0.
+    outputs['pred_logits'] = -outputs['pred_logits']
+    outputs['pred_keypoints'] = torch.rand(1, 2, 62) * 100
+    targets[0]['keypoints'] = torch.rand(2, 31, 2) * 100
+    second = matcher(outputs, targets)['indices'][0]
+    assert tuple(tensor.tolist() for tensor in first) == ([0, 1], [1, 0])
+    assert tuple(tensor.tolist() for tensor in second) == ([0, 1], [1, 0])
+
+
 def test_oks_loss_pixels_area_mask_and_empty_graph():
     from engine.rtv4.keypoint_loss import OKSLoss
     loss_fn = OKSLoss(loss_weight=25.)
