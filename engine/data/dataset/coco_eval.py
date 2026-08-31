@@ -15,7 +15,7 @@ from faster_coco_eval import COCO, COCOeval_faster
 import faster_coco_eval.core.mask as mask_util
 from ...core import register
 from ...misc import dist_utils
-__all__ = ['CocoEvaluator',]
+__all__ = ['CocoEvaluator', 'VehicleCocoEvaluator']
 
 
 @register()
@@ -198,3 +198,64 @@ def merge(img_ids, eval_imgs):
     merged_img_ids, idx = np.unique(merged_img_ids, return_index=True)
 
     return merged_img_ids.tolist(), merged_eval_imgs.tolist()
+
+
+@register()
+class VehicleCocoEvaluator(CocoEvaluator):
+    """Run the existing COCO bbox evaluator and vehicle pose metric together."""
+    def __init__(self, coco_gt, iou_types=('bbox',), num_keypoints=31,
+                 thresholds=(5.0, 10.0), iou_thr=.5, vis_thr=.5,
+                 score_thr=.05, margin=.05, crop_size=512,
+                 min_bbox_size=64.):
+        super().__init__(coco_gt, iou_types)
+        from .vehicle_keypoint_metric import VehicleKeypointMetric
+        self.vehicle_metric = VehicleKeypointMetric(
+            num_keypoints, thresholds, iou_thr, vis_thr, score_thr,
+            margin, crop_size, min_bbox_size)
+        self.vehicle_metrics = {}
+
+    def cleanup(self):
+        super().cleanup()
+        self.vehicle_metric.results.clear()
+        self.vehicle_metrics = {}
+
+    def update(self, predictions):
+        super().update(predictions)
+        samples = []
+        for image_id, pred in predictions.items():
+            annotations = [ann for ann in self.coco_gt.imgToAnns.get(image_id, [])
+                           if not ann.get('iscrowd', 0)]
+            boxes, labels, keypoints, visibility = [], [], [], []
+            for ann in annotations:
+                x, y, w, h = ann['bbox']
+                boxes.append([x, y, x + w, y + h])
+                labels.append(ann['category_id'])
+                raw = ann.get('keypoints')
+                if raw:
+                    kp = torch.as_tensor(raw, dtype=torch.float).reshape(-1, 3)
+                    keypoints.append(kp[:, :2]); visibility.append(kp[:, 2])
+                else:
+                    keypoints.append(torch.zeros(self.vehicle_metric.num_keypoints, 2))
+                    visibility.append(torch.zeros(self.vehicle_metric.num_keypoints))
+            gt = {
+                'boxes': torch.as_tensor(boxes, dtype=torch.float).reshape(-1, 4),
+                'labels': torch.as_tensor(labels, dtype=torch.long),
+                'keypoints': (torch.stack(keypoints) if keypoints else
+                              torch.zeros(0, self.vehicle_metric.num_keypoints, 2)),
+                'keypoints_visible': (torch.stack(visibility) if visibility else
+                                      torch.zeros(0, self.vehicle_metric.num_keypoints)),
+            }
+            samples.append({'pred_instances': pred, 'gt_instances': gt})
+        self.vehicle_metric.process(None, samples)
+
+    def synchronize_between_processes(self):
+        super().synchronize_between_processes()
+        gathered = dist_utils.all_gather(self.vehicle_metric.results)
+        self.vehicle_metric.results = [item for rank_results in gathered for item in rank_results]
+
+    def summarize(self):
+        super().summarize()
+        self.vehicle_metrics = self.vehicle_metric.compute_metrics()
+        print('Vehicle keypoint metrics:')
+        for name, value in self.vehicle_metrics.items():
+            print(f'  {name}: {value:.6f}' if isinstance(value, float) else f'  {name}: {value}')

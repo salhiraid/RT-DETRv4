@@ -21,7 +21,8 @@ torchvision.disable_beta_transforms_warning()
 faster_coco_eval.init_as_pycocotools()
 Image.MAX_IMAGE_PIXELS = None
 
-__all__ = ['CocoDetection']
+__all__ = ['CocoDetection', 'MultiCocoDetection']
+NUM_KEYPOINTS = 31
 
 
 @register()
@@ -90,6 +91,62 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         return {i: cat['id'] for i, cat in enumerate(self.categories)}
 
 
+@register()
+class MultiCocoDetection(DetDataset):
+    """Concatenate multiple COCO datasets while retaining Mosaic ``load_item``.
+
+    Dataset sizes determine their natural sampling ratio. ``repeat_factors`` can
+    be used to oversample smaller datasets by an integer factor.
+    """
+    __inject__ = ['transforms']
+    __share__ = ['remap_mscoco_category']
+
+    def __init__(self, img_folders, ann_files, transforms,
+                 repeat_factors=None, return_masks=False,
+                 remap_mscoco_category=False, img_folder=None, ann_file=None):
+        if len(img_folders) != len(ann_files):
+            raise ValueError('img_folders and ann_files must have the same length')
+        if not img_folders:
+            raise ValueError('MultiCocoDetection requires at least one dataset')
+        factors = repeat_factors or [1] * len(img_folders)
+        if len(factors) != len(img_folders) or any(int(x) != x or x < 1 for x in factors):
+            raise ValueError('repeat_factors must contain one positive integer per dataset')
+        self._transforms = transforms
+        self.datasets = [
+            CocoDetection(folder, annotation, transforms=None,
+                          return_masks=return_masks,
+                          remap_mscoco_category=remap_mscoco_category)
+            for folder, annotation in zip(img_folders, ann_files)
+        ]
+        reference_categories = self.datasets[0].categories
+        for dataset in self.datasets[1:]:
+            if dataset.categories != reference_categories:
+                raise ValueError('All datasets must define identical COCO categories')
+        self.index_map = [
+            (dataset_index, sample_index)
+            for dataset_index, (dataset, factor) in enumerate(zip(self.datasets, factors))
+            for _ in range(int(factor)) for sample_index in range(len(dataset))
+        ]
+        self.remap_mscoco_category = remap_mscoco_category
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def load_item(self, index):
+        dataset_index, sample_index = self.index_map[index]
+        return self.datasets[dataset_index].load_item(sample_index)
+
+    def __getitem__(self, index):
+        image, target = self.load_item(index)
+        if self._transforms is not None:
+            image, target, _ = self._transforms(image, target, self)
+        return image, target
+
+    @property
+    def categories(self):
+        return self.datasets[0].categories
+
+
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
     for polygons in segmentations:
@@ -140,21 +197,35 @@ class ConvertCocoPolysToMask(object):
             segmentations = [obj["segmentation"] for obj in anno]
             masks = convert_coco_poly_to_mask(segmentations, h, w)
 
-        keypoints = None
-        if anno and "keypoints" in anno[0]:
-            keypoints = [obj["keypoints"] for obj in anno]
-            keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
-            num_keypoints = keypoints.shape[0]
-            if num_keypoints:
-                keypoints = keypoints.view(num_keypoints, -1, 3)
+        # Every bbox has pose fields.  Bbox-only objects are not dropped: their
+        # placeholders are ignored exclusively by pose losses.
+        keypoints, keypoints_visible, ignore_keypoints = [], [], []
+        for obj in anno:
+            raw = obj.get('keypoints')
+            if raw:
+                kp = torch.as_tensor(raw, dtype=torch.float32).reshape(-1, 3)
+                if kp.shape[0] != NUM_KEYPOINTS:
+                    raise ValueError(f'Expected {NUM_KEYPOINTS} keypoints, got {kp.shape[0]}')
+                keypoints.append(kp[:, :2])
+                keypoints_visible.append(kp[:, 2])
+                ignore_keypoints.append(False)
+            else:
+                keypoints.append(torch.zeros(NUM_KEYPOINTS, 2))
+                keypoints_visible.append(torch.zeros(NUM_KEYPOINTS))
+                ignore_keypoints.append(True)
+        keypoints = torch.stack(keypoints) if keypoints else torch.zeros(0, NUM_KEYPOINTS, 2)
+        keypoints_visible = (torch.stack(keypoints_visible) if keypoints_visible else
+                             torch.zeros(0, NUM_KEYPOINTS))
+        ignore_keypoints = torch.tensor(ignore_keypoints, dtype=torch.bool)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
         if self.return_masks:
             masks = masks[keep]
-        if keypoints is not None:
-            keypoints = keypoints[keep]
+        keypoints = keypoints[keep]
+        keypoints_visible = keypoints_visible[keep]
+        ignore_keypoints = ignore_keypoints[keep]
 
         target = {}
         target["boxes"] = boxes
@@ -162,8 +233,9 @@ class ConvertCocoPolysToMask(object):
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
-        if keypoints is not None:
-            target["keypoints"] = keypoints
+        target["keypoints"] = keypoints
+        target["keypoints_visible"] = keypoints_visible
+        target["ignore_keypoints"] = ignore_keypoints
 
         # for conversion to coco api
         area = torch.tensor([obj["area"] for obj in anno])

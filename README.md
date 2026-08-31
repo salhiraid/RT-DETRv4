@@ -208,6 +208,88 @@ To train on your custom dataset, you need to organize it in the COCO format. Fol
 
 </details>
 
+### Train RT-DETRv4-S with 31 vehicle keypoints
+
+Use [`configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml`](./configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml).
+You only need to edit the following values in that file:
+
+```yaml
+num_classes: 1  # change if the dataset has more vehicle classes
+
+train_dataloader:
+  dataset:
+    img_folder: /absolute/path/to/vehicle/images/train
+    ann_file: /absolute/path/to/vehicle/annotations/train.json
+
+val_dataloader:
+  dataset:
+    img_folder: /absolute/path/to/vehicle/images/val
+    ann_file: /absolute/path/to/vehicle/annotations/val.json
+
+RTv4Criterion:
+  loss_keypoints_oks:
+    # Optional: point this at vehicle_31_kp_with_vis.py from custom MMPose.
+    metainfo: /absolute/path/to/vehicle_31_kp_with_vis.py
+```
+
+The JSON files must use COCO detection format. Each pose annotation must contain
+`31 * 3 = 93` flattened values under `keypoints` in `(x, y, visibility)` order.
+Annotations without `keypoints` are supported and remain bbox-supervised. Custom
+`category_id` values must be contiguous and zero-based (`0 .. num_classes - 1`).
+
+Train:
+
+```shell
+torchrun --nproc_per_node=1 train.py \
+  -c configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml \
+  --use-amp
+```
+
+Evaluate a checkpoint:
+
+```shell
+torchrun --nproc_per_node=1 train.py \
+  -c configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml \
+  -r /absolute/path/to/checkpoint.pth \
+  --test-only
+```
+
+#### Training with multiple COCO datasets
+
+For five training datasets, use
+[`configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml`](./configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml).
+Edit the five entries in `img_folders` and `ann_files`. All datasets must use
+the same category definitions and the same 31-keypoint ordering. The included
+`MultiDataSampler` draws 300,000 samples per global epoch with the requested
+`[25, 35, 15, 15, 10]` percentage ratio:
+
+```yaml
+train_dataloader:
+  shuffle: False
+  sampler:
+    type: MultiDataSampler
+    dataset_ratio: [25, 35, 15, 15, 10]
+    max_samples: 300000
+  dataset:
+    type: MultiCocoDetection
+    img_folders: [/data/a/train, /data/b/train, /data/c/train, /data/d/train, /data/e/train]
+    ann_files: [/data/a/train.json, /data/b/train.json, /data/c/train.json,
+                /data/d/train.json, /data/e/train.json]
+    repeat_factors: [1, 1, 1, 1, 1]
+```
+
+The ratios are normalized, so they may also be written as decimal weights.
+Sampling within each source dataset is with replacement. Keep
+`repeat_factors: [1, 1, 1, 1, 1]` because the sampler controls balancing.
+Use one stable validation dataset in `val_dataloader` so metrics remain directly
+comparable between epochs.
+
+```shell
+torchrun --nproc_per_node=1 train.py \
+  -c configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml \
+  --use-amp
+```
+
 ### Teacher Model Preparation
 
 Our framework uses a pre-trained Vision Foundation Model (VFM) as the teacher. We use the **ViT-B/16-LVD-1689M** model from DINOv3.

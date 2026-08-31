@@ -167,7 +167,9 @@ def create(type_or_name, global_cfg=GLOBAL_CONFIG, **kwargs):
             module_kwargs[k] = create(name, global_cfg)
 
         else:
-            raise ValueError(f'Inject does not support {_k}')
+            # Already-built dependencies are used by composite dataloaders and
+            # samplers that must share the exact same dataset instance.
+            module_kwargs[k] = _k
 
     # TODO hard code
     module_kwargs = {k: v for k, v in module_kwargs.items() if not k.startswith('_')}
