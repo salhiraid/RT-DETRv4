@@ -213,5 +213,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
         if 'segm' in iou_types:
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+        if hasattr(coco_evaluator, 'vehicle_metrics'):
+            stats.update(coco_evaluator.vehicle_metrics)
 
     return stats, coco_evaluator

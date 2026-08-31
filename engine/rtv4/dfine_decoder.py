@@ -339,6 +339,8 @@ class TransformerDecoder(nn.Module):
                 integral,
                 up,
                 reg_scale,
+                keypoint_xy_head=None,
+                keypoint_vis_head=None,
                 attn_mask=None,
                 memory_mask=None,
                 dn_meta=None):
@@ -350,6 +352,8 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
+        dec_out_keypoints_xy = []
+        dec_out_keypoints_vis = []
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -388,6 +392,15 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
+                if keypoint_xy_head is not None:
+                    keypoint_logits = keypoint_xy_head[i](output)
+                    keypoints_xy = self._decode_keypoints_inside_bbox(
+                        keypoint_logits, inter_ref_bbox)
+                    keypoints_vis = keypoint_vis_head[i](output)
+                    if keypoints_xy.shape[:2] != inter_ref_bbox.shape[:2]:
+                        raise RuntimeError('Keypoint and bbox queries are not aligned')
+                    dec_out_keypoints_xy.append(keypoints_xy)
+                    dec_out_keypoints_vis.append(keypoints_vis)
 
                 if not self.training:
                     break
@@ -396,8 +409,36 @@ class TransformerDecoder(nn.Module):
             ref_points_detach = inter_ref_bbox.detach()
             output_detach = output.detach()
 
+        additional = None
+        if keypoint_xy_head is not None:
+            additional = {
+                'keypoints_xy': torch.stack(dec_out_keypoints_xy),
+                'keypoints_vis': torch.stack(dec_out_keypoints_vis),
+            }
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, additional
+
+    @staticmethod
+    def _decode_keypoints_inside_bbox(keypoint_logits, bbox_cxcywh):
+        """Decode sigmoid-local points in the same detached query box."""
+        if keypoint_logits.shape[:-1] != bbox_cxcywh.shape[:-1]:
+            raise RuntimeError(
+                f'Keypoint/bbox query shape mismatch: keypoints={tuple(keypoint_logits.shape)}, '
+                f'bbox={tuple(bbox_cxcywh.shape)}')
+        if keypoint_logits.shape[-1] % 2:
+            raise RuntimeError('Keypoint XY dimension must be even.')
+        local_uv = keypoint_logits.sigmoid().reshape(*keypoint_logits.shape[:-1], -1, 2)
+        bbox = bbox_cxcywh.detach()
+        cx, cy, w, h = bbox.unbind(-1)
+        x1 = (cx - .5 * w.clamp(min=0)).clamp(0, 1)
+        y1 = (cy - .5 * h.clamp(min=0)).clamp(0, 1)
+        x2 = (cx + .5 * w.clamp(min=0)).clamp(0, 1)
+        y2 = (cy + .5 * h.clamp(min=0)).clamp(0, 1)
+        left, right = torch.minimum(x1, x2), torch.maximum(x1, x2)
+        top, bottom = torch.minimum(y1, y2), torch.maximum(y1, y2)
+        kp_x = left.unsqueeze(-1) + local_uv[..., 0] * (right - left).unsqueeze(-1)
+        kp_y = top.unsqueeze(-1) + local_uv[..., 1] * (bottom - top).unsqueeze(-1)
+        return torch.stack((kp_x, kp_y), -1).flatten(-2)
 
 
 @register()
@@ -431,6 +472,7 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,
                  layer_scale=1,
                  mlp_act='relu',
+                 which_keypoints=None,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -450,6 +492,8 @@ class DFINETransformer(nn.Module):
         self.num_layers = num_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
+        self.which_keypoints = list(which_keypoints or [])
+        self.use_keypoints = bool(self.which_keypoints)
         self.reg_max = reg_max
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
@@ -509,6 +553,15 @@ class DFINETransformer(nn.Module):
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
+        if self.use_keypoints:
+            def kpt_branch(dim, channels):
+                return MLP(dim, dim, channels, 5, act=mlp_act)
+            self.kps_xy_branches = nn.ModuleList(
+                [kpt_branch(hidden_dim if i <= self.eval_idx else scaled_dim,
+                            2 * len(self.which_keypoints)) for i in range(num_layers)])
+            self.kps_vis_branches = nn.ModuleList(
+                [kpt_branch(hidden_dim if i <= self.eval_idx else scaled_dim,
+                            len(self.which_keypoints)) for i in range(num_layers)])
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -728,7 +781,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, additional = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -740,6 +793,8 @@ class DFINETransformer(nn.Module):
             self.integral,
             self.up,
             self.reg_scale,
+            self.kps_xy_branches if self.use_keypoints else None,
+            self.kps_vis_branches if self.use_keypoints else None,
             attn_mask=attn_mask,
             dn_meta=dn_meta)
 
@@ -753,6 +808,12 @@ class DFINETransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
+            if additional is not None:
+                # Keypoints on denoising queries are intentionally discarded.
+                _, additional['keypoints_xy'] = torch.split(
+                    additional['keypoints_xy'], dn_meta['dn_num_split'], dim=2)
+                _, additional['keypoints_vis'] = torch.split(
+                    additional['keypoints_vis'], dn_meta['dn_num_split'], dim=2)
 
 
         if self.training:
@@ -760,10 +821,22 @@ class DFINETransformer(nn.Module):
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        if additional is not None:
+            out['pred_keypoints'] = additional['keypoints_xy'][-1]
+            out['pred_keypoints_vis'] = additional['keypoints_vis'][-1]
+            assert out['pred_keypoints'].shape[:2] == out['pred_boxes'].shape[:2]
+            assert out['pred_keypoints'].shape[-1] == 2 * len(self.which_keypoints)
+            assert out['pred_keypoints_vis'].shape[-1] == len(self.which_keypoints)
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
                                                      out_corners[-1], out_logits[-1])
+            if additional is not None:
+                for aux, kxy, kvis in zip(out['aux_outputs'],
+                                           additional['keypoints_xy'][:-1],
+                                           additional['keypoints_vis'][:-1]):
+                    aux['pred_keypoints'] = kxy
+                    aux['pred_keypoints_vis'] = kvis
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
