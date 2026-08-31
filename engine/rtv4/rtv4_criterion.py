@@ -29,7 +29,7 @@ class RTv4Criterion(nn.Module):
     """ This class computes the loss for RT-DETRv4.
     """
     __share__ = ['num_classes', ]
-    __inject__ = ['matcher', ]
+    __inject__ = ['matcher', 'loss_keypoints_oks']
 
     def __init__(self, \
                  matcher,
@@ -44,6 +44,10 @@ class RTv4Criterion(nn.Module):
                  mal_alpha=None,
                  use_uni_set=True,
                  distill_adaptive_params=None,
+                 which_keypoints=None,
+                 loss_keypoints_xy_weight=1.0,
+                 loss_keypoints_vis_weight=1.0,
+                 loss_keypoints_oks=None,
                  ):
         """Create the criterion.
         Parameters:
@@ -71,6 +75,70 @@ class RTv4Criterion(nn.Module):
         self.use_uni_set = use_uni_set
 
         self.distill_adaptive_params = distill_adaptive_params
+        self.which_keypoints = list(which_keypoints or [])
+        self.use_keypoints = bool(self.which_keypoints)
+        self.loss_keypoints_xy_weight = loss_keypoints_xy_weight
+        self.loss_keypoints_vis_weight = loss_keypoints_vis_weight
+        self.loss_keypoints_oks = loss_keypoints_oks
+
+    def loss_keypoints(self, outputs, targets, indices, num_boxes, **kwargs):
+        """Pose losses reuse detection Hungarian indices; bbox-only GT stays detected."""
+        pred_xy = outputs['pred_keypoints']
+        pred_vis = outputs['pred_keypoints_vis']
+        k = len(self.which_keypoints)
+        assert pred_xy.shape[:2] == outputs['pred_boxes'].shape[:2]
+        assert pred_xy.shape[-1] == 2 * k and pred_vis.shape[-1] == k
+
+        selected_xy, selected_vis, selected_pred_xy, selected_pred_vis = [], [], [], []
+        selected_boxes, selected_scales = [], []
+        for batch_index, ((src, dst), target) in enumerate(zip(indices, targets)):
+            if src.numel() == 0 or 'keypoints' not in target:
+                continue
+            ignore = target.get('ignore_keypoints', torch.ones(
+                len(target['labels']), dtype=torch.bool, device=src.device))[dst].bool()
+            gt_vis = target['keypoints_visible'][dst][:, self.which_keypoints]
+            valid = (~ignore) & (gt_vis > 0).any(-1)
+            if valid.any():
+                selected_pred_xy.append(pred_xy[batch_index, src[valid]].reshape(-1, k, 2))
+                selected_pred_vis.append(pred_vis[batch_index, src[valid]])
+                selected_xy.append(target['keypoints'][dst[valid]][:, self.which_keypoints])
+                selected_vis.append(gt_vis[valid])
+                if self.loss_keypoints_oks is not None:
+                    selected_boxes.append(target['boxes'][dst[valid]])
+                    size = target['size'] if 'size' in target else target['orig_size']
+                    selected_scales.append(size.to(pred_xy).expand(int(valid.sum()), 2))
+
+        if not selected_xy:
+            losses = {
+                'loss_keypoints_xy': pred_xy.sum() * 0.,
+                'loss_keypoints_vis': pred_vis.sum() * 0.,
+            }
+            if self.loss_keypoints_oks is not None:
+                losses['loss_keypoints_oks'] = pred_xy.sum() * 0.
+            return losses
+        pred_xy_valid = torch.cat(selected_pred_xy).float()
+        pred_vis_valid = torch.cat(selected_pred_vis).float()
+        target_xy = torch.cat(selected_xy).to(pred_xy_valid).float()
+        target_vis = torch.cat(selected_vis).to(pred_vis_valid).float()
+        coord_valid = target_vis > 0
+        loss_xy = F.l1_loss(pred_xy_valid[coord_valid], target_xy[coord_valid], reduction='mean')
+        visibility_target = ((target_vis == 2) if target_vis.max() > 1 else
+                             (target_vis > 0)).float()
+        loss_vis = F.binary_cross_entropy_with_logits(pred_vis_valid, visibility_target)
+        losses = {
+            'loss_keypoints_xy': loss_xy * self.loss_keypoints_xy_weight,
+            'loss_keypoints_vis': loss_vis * self.loss_keypoints_vis_weight,
+        }
+        if self.loss_keypoints_oks is not None:
+            scales = torch.cat(selected_scales).to(pred_xy_valid).float()
+            pred_pixels = pred_xy_valid * scales[:, None, :]
+            target_pixels = target_xy * scales[:, None, :]
+            boxes = torch.cat(selected_boxes).to(pred_xy_valid).float()
+            areas = (boxes[:, 2] * scales[:, 0]).clamp(min=1.) * \
+                    (boxes[:, 3] * scales[:, 1]).clamp(min=1.)
+            losses['loss_keypoints_oks'] = self.loss_keypoints_oks(
+                pred_pixels, target_pixels, target_vis, areas).float()
+        return losses
 
 
     def loss_distillation(self, outputs, targets, indices, num_boxes, **kwargs):
@@ -319,6 +387,7 @@ class RTv4Criterion(nn.Module):
             'mal': self.loss_labels_mal,
             'local': self.loss_local,
             'distill': self.loss_distillation,  # NEW: Add distillation loss
+            'keypoints': self.loss_keypoints,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -372,6 +441,8 @@ class RTv4Criterion(nn.Module):
         losses = {}
         for loss_name in self.losses:
             # TODO, indices and num_box are different from RT-DETRv2
+            if loss_name == 'keypoints' and not self.use_keypoints:
+                continue
             if loss_name == 'distill':
                 l_dict = self.get_loss(loss_name, outputs, targets, None, None, **kwargs)
                 if 'loss_distill' in l_dict and l_dict['loss_distill'] != 0:
@@ -393,6 +464,8 @@ class RTv4Criterion(nn.Module):
                 if 'local' in self.losses:  # only work for local loss
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
+                    if loss == 'keypoints' and not self.use_keypoints:
+                        continue
                     # TODO, indices and num_box are different from RT-DETRv2
                     use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
                     indices_in = indices_go if use_uni_set else cached_indices[i]
@@ -408,6 +481,8 @@ class RTv4Criterion(nn.Module):
         if 'pre_outputs' in outputs:
             aux_outputs = outputs['pre_outputs']
             for loss in self.losses:
+                if loss == 'keypoints':
+                    continue
                 # TODO, indices and num_box are different from RT-DETRv2
                 use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
                 indices_in = indices_go if use_uni_set else cached_indices[-1]
@@ -434,6 +509,8 @@ class RTv4Criterion(nn.Module):
 
             for i, aux_outputs in enumerate(outputs['enc_aux_outputs']):
                 for loss in self.losses:
+                    if loss == 'keypoints':
+                        continue
                     # TODO, indices and num_box are different from RT-DETRv2
                     use_uni_set = self.use_uni_set and (loss == 'boxes')
                     indices_in = indices_go if use_uni_set else cached_indices_enc[i]
@@ -458,6 +535,8 @@ class RTv4Criterion(nn.Module):
                     aux_outputs['is_dn'] = True
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
+                    if loss == 'keypoints':
+                        continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
