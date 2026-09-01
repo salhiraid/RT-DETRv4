@@ -21,6 +21,7 @@ from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
 
 import logging
+import warnings
 
 _logger = logging.getLogger(__name__)
 
@@ -89,6 +90,18 @@ class RTv4Criterion(nn.Module):
             use_sigmoid=True, reduction='mean',
             loss_weight=loss_keypoints_vis_weight)
         self.loss_keypoints_oks = loss_keypoints_oks
+        self._consecutive_empty_keypoint_batches = 0
+
+    @staticmethod
+    def _target_has_pose(target):
+        """Return whether a target has a non-ignored visible pose instance."""
+        visibility = target.get('keypoints_visible')
+        if visibility is None or visibility.ndim != 2:
+            return False
+        ignore = target.get(
+            'ignore_keypoints',
+            torch.ones(len(visibility), dtype=torch.bool, device=visibility.device))
+        return bool(((visibility > 0).any(dim=1) & ~ignore.bool()).any())
 
     def loss_keypoints(self, outputs, targets, indices, num_boxes, **kwargs):
         """Pose losses reuse detection Hungarian indices; bbox-only GT stays detected."""
@@ -430,6 +443,20 @@ class RTv4Criterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if self.use_keypoints:
+            has_pose = any(self._target_has_pose(target) for target in targets)
+            self._consecutive_empty_keypoint_batches = (
+                0 if has_pose else self._consecutive_empty_keypoint_batches + 1)
+            if self._consecutive_empty_keypoint_batches in (100, 1000):
+                warnings.warn(
+                    'No keypoint-supervised instance was found in the annotations '
+                    f'for {self._consecutive_empty_keypoint_batches} consecutive '
+                    'batches. Check that sampled objects contain 31 keypoints with '
+                    'at least one visibility value greater than zero. Bbox-only '
+                    'batches intentionally produce zero keypoint losses.',
+                    RuntimeWarning,
+                    stacklevel=2)
+
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         # Retrieve the matching between the outputs of the last layer and the targets
