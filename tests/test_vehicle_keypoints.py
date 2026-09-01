@@ -437,9 +437,64 @@ def test_validation_inference_json_and_visualization_keep_original_geometry():
     record = serialize_prediction(7, 1, result, .4)
     visualization = draw_prediction(
         Image.new('RGB', (320, 180)), result, .4, .5,
-        class_names=['a', 'b', 'vehicle'])
+        class_names=['a', 'b', 'vehicle'], ground_truth=[{
+            'bbox': [12, 22, 80, 50], 'category_name': 'vehicle',
+            'keypoints': [35, 45, 2, 55, 65, 0],
+        }])
 
     assert record['image_id'] == 7 and record['index'] == 1
     assert record['detections'][0]['bbox_xywh'] == [10., 20., 90., 60.]
     assert record['detections'][0]['keypoints_xy'] == [[30., 40.], [50., 60.]]
     assert visualization.size == (320, 180)
+
+
+def test_validation_inference_uses_descriptive_metric_names():
+    from tools.inference.validation_inference import collect_metrics
+
+    class CocoEval:
+        stats = torch.tensor([.25, .5, .4, .1, .2, .3])
+
+    class Evaluator:
+        coco_eval = {'bbox': CocoEval(), 'keypoints': CocoEval()}
+        vehicle_metrics = {'f1_10px': .75, 'vis_accuracy': .8}
+
+        def synchronize_between_processes(self): pass
+        def accumulate(self): pass
+        def summarize(self): pass
+
+    metrics = collect_metrics(Evaluator())
+    assert metrics['bbox_AP'] == .25
+    assert metrics['bbox_AP50'] == .5
+    assert metrics['bbox_AP_L'] == pytest.approx(.3)
+    assert metrics['keypoints_AP'] == .25
+    assert metrics['keypoints_F1@10px'] == .75
+    assert metrics['keypoints_VisibilityAccuracy'] == .8
+
+
+def test_training_tensorboard_uses_all_descriptive_evaluation_metrics():
+    from engine.solver.det_solver import tensorboard_evaluation_metrics
+
+    stats = {
+        'coco_eval_bbox': [float(index) / 10 for index in range(12)],
+        'precision_5px': .51,
+        'recall_5px': .52,
+        'f1_5px': .53,
+        'precision_10px': .61,
+        'recall_10px': .62,
+        'f1_10px': .63,
+        'vis_precision': .71,
+        'vis_recall': .72,
+        'vis_f1': .73,
+        'vis_accuracy': .74,
+    }
+
+    metrics = tensorboard_evaluation_metrics(stats)
+    assert metrics['BBoxes/AP'] == 0.
+    assert metrics['BBoxes/AP50'] == .1
+    assert metrics['BBoxes/AP_L'] == .5
+    assert metrics['BBoxes/AR_L'] == 1.1
+    assert metrics['Keypoints/Precision@5px'] == .51
+    assert metrics['Keypoints/Recall@10px'] == .62
+    assert metrics['Keypoints/F1@10px'] == .63
+    assert metrics['Keypoints/VisibilityF1'] == .73
+    assert metrics['Keypoints/VisibilityAccuracy'] == .74

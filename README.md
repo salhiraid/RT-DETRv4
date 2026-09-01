@@ -298,6 +298,14 @@ The script evaluates the config's complete validation dataset and writes
 `visualizations/2.jpg`, and so on. Bounding boxes and keypoints are mapped to
 the original image coordinates, and each visualization retains its source
 image dimensions.
+Predicted boxes/keypoints are red/green, while COCO ground-truth boxes and
+keypoints are blue/cyan. Only visible keypoints are drawn and every keypoint is
+labeled with its one-based index. `metrics.txt` uses descriptive metric names
+instead of numeric indices, including `bbox_AP`, `bbox_AP50`, `bbox_AP_L`,
+`keypoints_AP`, and vehicle pose metrics such as `keypoints_F1@10px`.
+During training, TensorBoard records every COCO bbox AP/AR metric under
+`Test/BBoxes/`, the 5 px and 10 px keypoint precision/recall/F1 metrics under
+`Test/Keypoints/`, and all keypoint visibility metrics in the same group.
 
 #### Training with multiple COCO datasets
 

@@ -58,8 +58,13 @@ def serialize_prediction(image_id, image_index, result, score_threshold):
 
 
 def draw_prediction(image, result, score_threshold, keypoint_threshold,
-                    class_names=None):
-    """Draw postprocessed boxes and visible keypoints on an original PIL image."""
+                    class_names=None, ground_truth=None):
+    """Draw predictions and optional COCO ground truth on an original image.
+
+    Predictions use red boxes and green keypoints; ground truth uses blue boxes
+    and cyan keypoints.  Keypoint labels are one-based and only visible points
+    are drawn (score threshold for predictions and COCO visibility > 0 for GT).
+    """
     result = _cpu_result(result)
     canvas = image.copy()
     painter = ImageDraw.Draw(canvas)
@@ -78,14 +83,56 @@ def draw_prediction(image, result, score_threshold, keypoint_threshold,
         painter.text((box[0], box[1]), f'{label_text} {float(score):.3f}',
                      fill='red')
         if keypoints is not None:
-            for point, point_score in zip(keypoints, keypoint_scores):
+            for keypoint_index, (point, point_score) in enumerate(
+                    zip(keypoints, keypoint_scores), start=1):
                 if float(point_score) >= keypoint_threshold:
                     x, y = point.tolist()
                     radius = 3
                     painter.ellipse(
                         (x - radius, y - radius, x + radius, y + radius),
                         fill='lime', outline='green')
+                    painter.text((x + radius + 1, y - radius),
+                                 str(keypoint_index), fill='lime')
+
+    for annotation in ground_truth or []:
+        x, y, width, height = annotation['bbox']
+        painter.rectangle((x, y, x + width, y + height),
+                          outline='blue', width=3)
+        label = annotation.get('category_name', annotation.get('category_id', 'GT'))
+        painter.text((x, y + 12), f'GT {label}', fill='blue')
+        raw_keypoints = annotation.get('keypoints') or []
+        for keypoint_index in range(len(raw_keypoints) // 3):
+            point_x, point_y, visibility = raw_keypoints[keypoint_index * 3:keypoint_index * 3 + 3]
+            if visibility <= 0:
+                continue
+            radius = 3
+            painter.ellipse(
+                (point_x - radius, point_y - radius,
+                 point_x + radius, point_y + radius),
+                fill='cyan', outline='blue')
+            painter.text((point_x + radius + 1, point_y - radius),
+                         str(keypoint_index + 1), fill='cyan')
     return canvas
+
+
+def load_ground_truth(dataset, image_id):
+    """Return original-coordinate COCO annotations from a wrapped dataset."""
+    current = dataset
+    for _ in range(10):
+        if hasattr(current, 'coco'):
+            annotation_ids = current.coco.getAnnIds(imgIds=[int(image_id)])
+            annotations = current.coco.loadAnns(annotation_ids)
+            categories = getattr(current.coco, 'cats', {})
+            for annotation in annotations:
+                category = categories.get(annotation.get('category_id'), {})
+                annotation['category_name'] = category.get(
+                    'name', annotation.get('category_id', 'GT'))
+            return annotations
+        if hasattr(current, 'dataset'):
+            current = current.dataset
+        else:
+            break
+    return []
 
 
 def load_original_image(dataset, image_id, fallback_tensor, original_size):
@@ -111,17 +158,37 @@ def collect_metrics(evaluator):
     evaluator.accumulate()
     evaluator.summarize()
     metrics = {}
-    coco_metric_names = (
-        'AP', 'AP50', 'AP75', 'AP_small', 'AP_medium', 'AP_large',
-        'AR_1', 'AR_10', 'AR_100', 'AR_small', 'AR_medium', 'AR_large')
+    detection_metric_names = (
+        'AP', 'AP50', 'AP75', 'AP_S', 'AP_M', 'AP_L',
+        'AR_1', 'AR_10', 'AR_100', 'AR_S', 'AR_M', 'AR_L')
+    keypoint_metric_names = (
+        'AP', 'AP50', 'AP75', 'AP_M', 'AP_L',
+        'AR', 'AR50', 'AR75', 'AR_M', 'AR_L')
     for iou_type, coco_eval in evaluator.coco_eval.items():
+        metric_names = (keypoint_metric_names if iou_type == 'keypoints'
+                        else detection_metric_names)
         for index, value in enumerate(coco_eval.stats.tolist()):
-            name = (coco_metric_names[index] if index < len(coco_metric_names)
-                    else str(index))
-            metrics[f'coco_{iou_type}_{name}'] = float(value)
+            metric_name = (metric_names[index]
+                           if index < len(metric_names) else str(index))
+            metrics[f'{iou_type}_{metric_name}'] = float(value)
     if hasattr(evaluator, 'vehicle_metrics'):
-        metrics.update({key: float(value)
-                        for key, value in evaluator.vehicle_metrics.items()})
+        vehicle_metric_names = {
+            'precision_5px': 'keypoints_Precision@5px',
+            'recall_5px': 'keypoints_Recall@5px',
+            'f1_5px': 'keypoints_F1@5px',
+            'precision_10px': 'keypoints_Precision@10px',
+            'recall_10px': 'keypoints_Recall@10px',
+            'f1_10px': 'keypoints_F1@10px',
+            'vis_precision': 'keypoints_VisibilityPrecision',
+            'vis_recall': 'keypoints_VisibilityRecall',
+            'vis_f1': 'keypoints_VisibilityF1',
+            'vis_accuracy': 'keypoints_VisibilityAccuracy',
+            'num_matched': 'keypoints_MatchedDetections',
+            'num_gt': 'keypoints_GroundTruthDetections',
+            'matched_ratio': 'keypoints_MatchedRatio',
+        }
+        for name, value in evaluator.vehicle_metrics.items():
+            metrics[vehicle_metric_names.get(name, f'keypoints_{name}')] = float(value)
     return metrics
 
 
@@ -178,7 +245,8 @@ def run(args):
                     data_loader.dataset, image_id, sample, (width, height))
                 visualization = draw_prediction(
                     original, result, args.score_threshold,
-                    args.keypoint_threshold, class_names)
+                    args.keypoint_threshold, class_names,
+                    load_ground_truth(data_loader.dataset, image_id))
                 visualization.save(visualization_dir / f'{image_index}.jpg')
 
     (output_dir / 'predictions.json').write_text(
