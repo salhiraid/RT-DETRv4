@@ -12,6 +12,7 @@ import torchvision.transforms.v2.functional as F
 
 import PIL
 import PIL.Image
+from PIL import ImageFile
 
 from typing import Any, Dict, List, Optional
 
@@ -21,11 +22,25 @@ from .._misc import SanitizeBoundingBoxes as TVSanitizeBoundingBoxes
 
 from ...core import register
 torchvision.disable_beta_transforms_warning()
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def _spatial_size(value):
     getter = F.get_size if hasattr(F, 'get_size') else F.get_spatial_size
     return getter(value)
+
+
+def _unpack_sample(inputs):
+    """Accept both a structured sample and separate transform arguments."""
+    sample = inputs[0] if len(inputs) == 1 and isinstance(inputs[0], (tuple, list)) else inputs
+    if not sample:
+        raise ValueError('Empty transform sample')
+    return (sample[0], sample[1] if len(sample) > 1 else None,
+            tuple(sample[2:]))
+
+
+def _repack_sample(image, target=None, extra=()):
+    return image if target is None else (image, target, *extra)
 
 
 RandomPhotometricDistort = register()(T.RandomPhotometricDistort)
@@ -39,7 +54,8 @@ Normalize = register()(T.Normalize)
 
 @register(name='SanitizeBoundingBoxes')
 class SanitizeBoundingBoxes(TVSanitizeBoundingBoxes):
-    def forward(self, image, target=None, *extra):
+    def forward(self, *inputs):
+        image, target, extra = _unpack_sample(inputs)
         if target is None or 'boxes' not in target:
             return super().forward(image, target, *extra)
         boxes = target['boxes']
@@ -63,12 +79,33 @@ class FillKeypoints(T.Transform):
         super().__init__()
         self.num_keypoints = num_keypoints
 
-    def forward(self, image, target, *extra):
+    def forward(self, *inputs):
+        image, target, extra = _unpack_sample(inputs)
+        if target is None:
+            return image
         n = len(target.get('boxes', []))
-        if 'keypoints' not in target or target['keypoints'].ndim != 3:
-            target['keypoints'] = torch.zeros(n, self.num_keypoints, 2)
-            target['keypoints_visible'] = torch.zeros(n, self.num_keypoints)
-            target['ignore_keypoints'] = torch.ones(n, dtype=torch.bool)
+        keypoints = target.get('keypoints')
+        if not torch.is_tensor(keypoints) or keypoints.ndim != 3:
+            device = target['boxes'].device if torch.is_tensor(target.get('boxes')) else None
+            target['keypoints'] = torch.zeros(
+                n, self.num_keypoints, 2, dtype=torch.float32, device=device)
+            target['keypoints_visible'] = torch.zeros(
+                n, self.num_keypoints, dtype=torch.float32, device=device)
+            target['ignore_keypoints'] = torch.ones(n, dtype=torch.bool, device=device)
+        else:
+            if keypoints.shape[1] != self.num_keypoints or keypoints.shape[-1] not in (2, 3):
+                raise RuntimeError(
+                    f'Expected keypoints shaped [N,{self.num_keypoints},2 or 3], '
+                    f'got {tuple(keypoints.shape)}')
+            if keypoints.shape[-1] == 3:
+                target.setdefault('keypoints_visible', keypoints[..., 2].clone())
+                target['keypoints'] = keypoints[..., :2].clone()
+            else:
+                target.setdefault('keypoints_visible', torch.zeros(
+                    n, self.num_keypoints, dtype=keypoints.dtype,
+                    device=keypoints.device))
+            target.setdefault(
+                'ignore_keypoints', target['keypoints_visible'].sum(dim=1) == 0)
         if not (n == len(target['labels']) == len(target['keypoints']) ==
                 len(target['keypoints_visible']) == len(target['ignore_keypoints'])):
             raise RuntimeError('bbox/keypoint instance fields are not aligned')
@@ -77,7 +114,8 @@ class FillKeypoints(T.Transform):
 
 @register()
 class Resize(T.Resize):
-    def forward(self, image, target=None, *extra):
+    def forward(self, *inputs):
+        image, target, extra = _unpack_sample(inputs)
         if target is None:
             return super().forward(image)
         old_h, old_w = _spatial_size(image)
@@ -97,7 +135,8 @@ class Resize(T.Resize):
 @register()
 class RandomHorizontalFlip(T.RandomHorizontalFlip):
     """Flip coordinates only; no semantic permutation is invented."""
-    def forward(self, image, target=None, *extra):
+    def forward(self, *inputs):
+        image, target, extra = _unpack_sample(inputs)
         if target is None or torch.rand(1) >= self.p:
             return (image, target, *extra) if target is not None else image
         width = _spatial_size(image)[1]
@@ -163,13 +202,15 @@ class RandomIoUCrop(T.RandomIoUCrop):
         super().__init__(min_scale, max_scale, min_aspect_ratio, max_aspect_ratio, sampler_options, trials)
         self.p = p
 
-    def __call__(self, *inputs: Any) -> Any:
+    def forward(self, *inputs: Any) -> Any:
+        image, target, extra = _unpack_sample(inputs)
         if torch.rand(1) >= self.p:
-            return inputs if len(inputs) > 1 else inputs[0]
-        image, target, *extra = inputs
+            return _repack_sample(image, target, extra)
+        if target is None:
+            return image
         params = self.make_params([image, target['boxes']])
         if not params:
-            return inputs if len(inputs) > 1 else inputs[0]
+            return _repack_sample(image, target, extra)
         crop = dict(top=params['top'], left=params['left'],
                     height=params['height'], width=params['width'])
         image = F.crop(image, **crop)
@@ -188,7 +229,7 @@ class RandomIoUCrop(T.RandomIoUCrop):
             visible[~inside] = 0
             keypoints[~inside] = 0
             target['keypoints'], target['keypoints_visible'] = keypoints, visible
-        return (image, target, *extra)
+        return _repack_sample(image, target, extra)
 
 
 @register()
@@ -216,13 +257,14 @@ class ConvertBoxes(T.Transform):
 
         return inpt
 
-    def forward(self, image, target=None, *extra):
+    def forward(self, *inputs):
+        image, target, extra = _unpack_sample(inputs)
         output = super().forward(image, target) if target is not None else super().forward(image)
         if target is not None and self.normalize and 'keypoints' in output[1]:
             image, target = output
             h, w = _spatial_size(image)
             target['keypoints'] = target['keypoints'] / target['keypoints'].new_tensor([w, h])
-            target['size'] = torch.as_tensor([w, h], device=target['keypoints'].device)
+            target['size'] = torch.as_tensor([h, w], device=target['keypoints'].device)
             output = (image, target)
         return (*output, *extra) if extra else output
 
