@@ -1,5 +1,6 @@
 import torch
 import json
+import pytest
 from PIL import Image
 
 from engine.data.dataset.coco_dataset import ConvertCocoPolysToMask
@@ -103,15 +104,31 @@ def test_bbox_only_and_mixed_pose_loss():
     assert losses['loss_keypoints_xy'] > 0 and outputs['pred_keypoints'].grad.abs().sum() > 0
 
 
-def test_target_pose_diagnostic_requires_visible_nonignored_instance():
-    target = {
-        'keypoints_visible': torch.zeros(2, 31),
-        'ignore_keypoints': torch.tensor([True, False]),
-    }
-    target['keypoints_visible'][0].fill_(2)
-    assert not RTv4Criterion._target_has_pose(target)
-    target['keypoints_visible'][1, 0] = 1
-    assert RTv4Criterion._target_has_pose(target)
+def test_pose_loss_accepts_cpu_match_indices_for_cuda_predictions():
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA is required for the cross-device regression test')
+
+    device = torch.device('cuda')
+    outputs = dict(
+        pred_boxes=torch.rand(1, 2, 4, device=device),
+        pred_logits=torch.rand(1, 2, 1, device=device),
+        pred_keypoints=torch.rand(
+            1, 2, 62, device=device, requires_grad=True),
+        pred_keypoints_vis=torch.rand(
+            1, 2, 31, device=device, requires_grad=True))
+    target = dict(
+        labels=torch.zeros(2, dtype=torch.long, device=device),
+        boxes=torch.rand(2, 4, device=device),
+        keypoints=torch.rand(2, 31, 2, device=device),
+        keypoints_visible=torch.full((2, 31), 2, device=device),
+        ignore_keypoints=torch.zeros(2, dtype=torch.bool, device=device))
+    cpu_indices = [(torch.arange(2), torch.arange(2))]
+
+    losses = criterion().loss_keypoints(outputs, [target], cpu_indices, 2)
+    sum(losses.values()).backward()
+
+    assert outputs['pred_keypoints'].grad.abs().sum() > 0
+    assert outputs['pred_keypoints_vis'].grad.abs().sum() > 0
 
 
 def test_inference_alignment_and_metric_contract():
@@ -199,6 +216,41 @@ def test_criterion_exposes_oks_for_pose_and_empty_batches():
     assert losses['loss_keypoints_oks'] > 0
     sum(losses.values()).backward()
     assert outputs['pred_keypoints'].grad.abs().sum() > 0
+
+
+def test_configured_keypoint_losses_apply_requested_weights():
+    from engine.rtv4.keypoint_loss import CrossEntropyLoss, L1Loss, OKSLoss
+
+    crit = RTv4Criterion(
+        Matcher(), {
+            'loss_keypoints_xy': 1, 'loss_keypoints_vis': 1,
+            'loss_keypoints_oks': 1}, ['keypoints'],
+        which_keypoints=list(range(31)),
+        loss_keypoints_xy=L1Loss(reduction='mean', loss_weight=10),
+        loss_keypoints_vis=CrossEntropyLoss(
+            use_sigmoid=True, reduction='mean', loss_weight=3),
+        loss_keypoints_oks=OKSLoss(reduction='mean', loss_weight=35))
+    outputs = dict(
+        pred_boxes=torch.tensor([[[.5, .5, .5, .5]]]),
+        pred_logits=torch.zeros(1, 1, 1),
+        pred_keypoints=torch.zeros(1, 1, 62, requires_grad=True),
+        pred_keypoints_vis=torch.zeros(1, 1, 31, requires_grad=True))
+    target = dict(
+        labels=torch.zeros(1, dtype=torch.long),
+        boxes=torch.tensor([[.5, .5, .5, .5]]),
+        keypoints=torch.ones(1, 31, 2),
+        keypoints_visible=torch.full((1, 31), 2),
+        ignore_keypoints=torch.zeros(1, dtype=torch.bool),
+        size=torch.tensor([100, 100]))
+
+    losses = crit.loss_keypoints(
+        outputs, [target], [(torch.tensor([0]), torch.tensor([0]))], 1)
+
+    assert torch.isclose(losses['loss_keypoints_xy'], torch.tensor(10.0))
+    expected_vis = torch.log(torch.tensor(2.0)) * 3
+    assert torch.isclose(losses['loss_keypoints_vis'], expected_vis)
+    expected_oks = (1 - torch.exp(torch.tensor(-4.0))) * 35
+    assert torch.isclose(losses['loss_keypoints_oks'], expected_oks)
 
 
 def test_multiple_coco_datasets_concat_and_repeat(tmp_path):
@@ -357,27 +409,37 @@ def test_yaml_config_exposes_eval_spatial_size(tmp_path):
     assert config.eval_spatial_size == [672, 1184]
 
 
-def test_checkpoint_inference_json_preserves_original_coordinates(tmp_path):
-    from tools.inference.checkpoint_inference import (
-        checkpoint_state, discover_images, prediction_to_json, visualize)
+def test_eval_mode_forces_validation_batch_size_one():
+    from train import configure_evaluation
 
-    image_path = tmp_path / 'frame.jpg'
-    Image.new('RGB', (1200, 700)).save(image_path)
-    assert discover_images(tmp_path) == [image_path]
-    weights = {'weight': torch.ones(1)}
-    assert checkpoint_state({'ema': {'module': weights}}) is weights
+    class Config:
+        yaml_cfg = {
+            'val_dataloader': {'total_batch_size': 64, 'shuffle': False}}
+
+    config = Config()
+    configure_evaluation(config, 1)
+
+    assert config.yaml_cfg['val_dataloader']['batch_size'] == 1
+    assert 'total_batch_size' not in config.yaml_cfg['val_dataloader']
+
+
+def test_validation_inference_json_and_visualization_keep_original_geometry():
+    from tools.inference.validation_inference import (
+        draw_prediction, serialize_prediction)
 
     result = {
-        'labels': torch.tensor([3]),
+        'labels': torch.tensor([2]),
         'scores': torch.tensor([.9]),
-        'boxes': torch.tensor([[100., 50., 1100., 650.]]),
-        'keypoints': torch.tensor([[[600., 350.], [900., 500.]]]),
+        'boxes': torch.tensor([[10., 20., 100., 80.]]),
+        'keypoints_xy': torch.tensor([[[30., 40.], [50., 60.]]]),
         'keypoint_scores': torch.tensor([[.8, .2]]),
     }
-    record = prediction_to_json(image_path, 1200, 700, result, .4, .5)
-    detection = record['detections'][0]
-    assert detection['bbox_xyxy'] == [100., 50., 1100., 650.]
-    assert detection['bbox_xywh'] == [100., 50., 1000., 600.]
-    assert detection['visible_keypoints'] == [True, False]
-    rendered = visualize(Image.open(image_path), record, .5)
-    assert rendered.size == (1200, 700)
+    record = serialize_prediction(7, 1, result, .4)
+    visualization = draw_prediction(
+        Image.new('RGB', (320, 180)), result, .4, .5,
+        class_names=['a', 'b', 'vehicle'])
+
+    assert record['image_id'] == 7 and record['index'] == 1
+    assert record['detections'][0]['bbox_xywh'] == [10., 20., 90., 60.]
+    assert record['detections'][0]['keypoints_xy'] == [[30., 40.], [50., 60.]]
+    assert visualization.size == (320, 180)

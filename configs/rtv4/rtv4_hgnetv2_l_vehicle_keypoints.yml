@@ -17,13 +17,20 @@ RTv4Criterion:
     weight_dict: {cost_class: 0, cost_bbox: 5, cost_giou: 2}
   which_keypoints: *vehicle_keypoints
   losses: ['mal', 'boxes', 'local', 'distill', 'keypoints']
-  loss_keypoints_xy_weight: 10.0
-  loss_keypoints_vis_weight: 3.0
+  loss_keypoints_xy:
+    type: L1Loss
+    reduction: mean
+    loss_weight: 10.0
+  loss_keypoints_vis:
+    type: CrossEntropyLoss
+    use_sigmoid: True
+    reduction: mean
+    loss_weight: 3.0
   loss_keypoints_oks:
     type: OKSLoss
     metainfo: ~  # Set to your custom MMPose vehicle metainfo file to load sigmas/weights.
     reduction: mean
-    loss_weight: 25.0
+    loss_weight: 35.0
   weight_dict:
     loss_keypoints_xy: 1.0
     loss_keypoints_vis: 1.0

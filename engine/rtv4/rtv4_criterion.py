@@ -16,6 +16,7 @@ import copy
 
 from .dfine_utils import bbox2distance
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from .keypoint_loss import CrossEntropyLoss, L1Loss
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
 
@@ -30,7 +31,9 @@ class RTv4Criterion(nn.Module):
     """ This class computes the loss for RT-DETRv4.
     """
     __share__ = ['num_classes', ]
-    __inject__ = ['matcher', 'loss_keypoints_oks']
+    __inject__ = [
+        'matcher', 'loss_keypoints_xy', 'loss_keypoints_vis',
+        'loss_keypoints_oks']
 
     def __init__(self, \
                  matcher,
@@ -48,6 +51,8 @@ class RTv4Criterion(nn.Module):
                  which_keypoints=None,
                  loss_keypoints_xy_weight=1.0,
                  loss_keypoints_vis_weight=1.0,
+                 loss_keypoints_xy=None,
+                 loss_keypoints_vis=None,
                  loss_keypoints_oks=None,
                  ):
         """Create the criterion.
@@ -78,8 +83,12 @@ class RTv4Criterion(nn.Module):
         self.distill_adaptive_params = distill_adaptive_params
         self.which_keypoints = list(which_keypoints or [])
         self.use_keypoints = bool(self.which_keypoints)
-        self.loss_keypoints_xy_weight = loss_keypoints_xy_weight
-        self.loss_keypoints_vis_weight = loss_keypoints_vis_weight
+        # Keep the legacy scalar arguments as fallbacks for older configs.
+        self.loss_keypoints_xy = loss_keypoints_xy or L1Loss(
+            reduction='mean', loss_weight=loss_keypoints_xy_weight)
+        self.loss_keypoints_vis = loss_keypoints_vis or CrossEntropyLoss(
+            use_sigmoid=True, reduction='mean',
+            loss_weight=loss_keypoints_vis_weight)
         self.loss_keypoints_oks = loss_keypoints_oks
         self._consecutive_empty_keypoint_batches = 0
 
@@ -107,17 +116,38 @@ class RTv4Criterion(nn.Module):
         for batch_index, ((src, dst), target) in enumerate(zip(indices, targets)):
             if src.numel() == 0 or 'keypoints' not in target:
                 continue
-            ignore = target.get('ignore_keypoints', torch.ones(
-                len(target['labels']), dtype=torch.bool, device=src.device))[dst].bool()
-            gt_vis = target['keypoints_visible'][dst][:, self.which_keypoints]
+
+            # SciPy-based matchers commonly return CPU indices even when model
+            # predictions and training targets are on CUDA. Keep prediction
+            # indices on the prediction device and target indices/masks on the
+            # target device instead of mixing them in ``src[valid]``.
+            target_device = target['keypoints_visible'].device
+            src_pred = src.to(device=pred_xy.device, dtype=torch.long)
+            dst_target = dst.to(device=target_device, dtype=torch.long)
+            ignore_all = target.get('ignore_keypoints')
+            if ignore_all is None:
+                ignore_all = torch.ones(
+                    len(target['labels']), dtype=torch.bool,
+                    device=target_device)
+            else:
+                ignore_all = ignore_all.to(device=target_device, dtype=torch.bool)
+            ignore = ignore_all[dst_target]
+            gt_vis = target['keypoints_visible'][dst_target][
+                :, self.which_keypoints]
             valid = (~ignore) & (gt_vis > 0).any(-1)
             if valid.any():
-                selected_pred_xy.append(pred_xy[batch_index, src[valid]].reshape(-1, k, 2))
-                selected_pred_vis.append(pred_vis[batch_index, src[valid]])
-                selected_xy.append(target['keypoints'][dst[valid]][:, self.which_keypoints])
+                pred_indices = src_pred[valid.to(src_pred.device)]
+                target_indices = dst_target[valid]
+                selected_pred_xy.append(
+                    pred_xy[batch_index, pred_indices].reshape(-1, k, 2))
+                selected_pred_vis.append(pred_vis[batch_index, pred_indices])
+                selected_xy.append(
+                    target['keypoints'].to(target_device)[target_indices][
+                        :, self.which_keypoints])
                 selected_vis.append(gt_vis[valid])
                 if self.loss_keypoints_oks is not None:
-                    selected_boxes.append(target['boxes'][dst[valid]])
+                    selected_boxes.append(
+                        target['boxes'].to(target_device)[target_indices])
                     size = target['size'] if 'size' in target else target['orig_size']
                     selected_scales.append(size.to(pred_xy).expand(int(valid.sum()), 2))
 
@@ -134,13 +164,14 @@ class RTv4Criterion(nn.Module):
         target_xy = torch.cat(selected_xy).to(pred_xy_valid).float()
         target_vis = torch.cat(selected_vis).to(pred_vis_valid).float()
         coord_valid = target_vis > 0
-        loss_xy = F.l1_loss(pred_xy_valid[coord_valid], target_xy[coord_valid], reduction='mean')
+        loss_xy = self.loss_keypoints_xy(
+            pred_xy_valid[coord_valid], target_xy[coord_valid])
         visibility_target = ((target_vis == 2) if target_vis.max() > 1 else
                              (target_vis > 0)).float()
-        loss_vis = F.binary_cross_entropy_with_logits(pred_vis_valid, visibility_target)
+        loss_vis = self.loss_keypoints_vis(pred_vis_valid, visibility_target)
         losses = {
-            'loss_keypoints_xy': loss_xy * self.loss_keypoints_xy_weight,
-            'loss_keypoints_vis': loss_vis * self.loss_keypoints_vis_weight,
+            'loss_keypoints_xy': loss_xy,
+            'loss_keypoints_vis': loss_vis,
         }
         if self.loss_keypoints_oks is not None:
             scales = torch.cat(selected_scales).to(pred_xy_valid).float()
