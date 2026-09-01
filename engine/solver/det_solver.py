@@ -20,6 +20,49 @@ from .det_engine import train_one_epoch, evaluate
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 
+COCO_BBOX_METRIC_NAMES = (
+    'AP', 'AP50', 'AP75', 'AP_S', 'AP_M', 'AP_L',
+    'AR_1', 'AR_10', 'AR_100', 'AR_S', 'AR_M', 'AR_L')
+
+KEYPOINT_METRIC_NAMES = {
+    'precision_5px': 'Precision@5px',
+    'recall_5px': 'Recall@5px',
+    'f1_5px': 'F1@5px',
+    'precision_10px': 'Precision@10px',
+    'recall_10px': 'Recall@10px',
+    'f1_10px': 'F1@10px',
+    'vis_precision': 'VisibilityPrecision',
+    'vis_recall': 'VisibilityRecall',
+    'vis_f1': 'VisibilityF1',
+    'vis_accuracy': 'VisibilityAccuracy',
+    'num_matched': 'MatchedDetections',
+    'num_gt': 'GroundTruthDetections',
+    'matched_ratio': 'MatchedRatio',
+}
+
+
+def tensorboard_evaluation_metrics(test_stats):
+    """Flatten evaluation results into descriptive TensorBoard scalar names."""
+    metrics = {}
+    for name, value in test_stats.items():
+        if name == 'coco_eval_bbox':
+            for metric_name, metric_value in zip(COCO_BBOX_METRIC_NAMES, value):
+                metrics[f'BBoxes/{metric_name}'] = metric_value
+        elif name in KEYPOINT_METRIC_NAMES:
+            metrics[f'Keypoints/{KEYPOINT_METRIC_NAMES[name]}'] = value
+        elif isinstance(value, (list, tuple)):
+            for index, metric_value in enumerate(value):
+                metrics[f'{name}/{index}'] = metric_value
+        else:
+            metrics[name] = value
+    return metrics
+
+
+def _primary_metric_value(value):
+    """Return a scalar used by the existing best-checkpoint bookkeeping."""
+    return value[0] if isinstance(value, (list, tuple)) else value
+
+
 class DetSolver(BaseSolver):
 
     def fit(self, ):
@@ -55,8 +98,8 @@ class DetSolver(BaseSolver):
             )
             for k in test_stats:
                 best_stat['epoch'] = self.last_epoch
-                best_stat[k] = test_stats[k][0]
-                top1 = test_stats[k][0]
+                best_stat[k] = _primary_metric_value(test_stats[k])
+                top1 = _primary_metric_value(test_stats[k])
                 print(f'best_stat: {best_stat}')
 
         best_stat_print = best_stat.copy()
@@ -158,18 +201,18 @@ class DetSolver(BaseSolver):
                 self.device
             )
 
-            # TODO
-            for k in test_stats:
-                if self.writer and dist_utils.is_main_process():
-                    for i, v in enumerate(test_stats[k]):
-                        self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+            if self.writer and dist_utils.is_main_process():
+                for name, value in tensorboard_evaluation_metrics(test_stats).items():
+                    self.writer.add_scalar(f'Test/{name}', value, epoch)
 
+            for k in test_stats:
+                current_value = _primary_metric_value(test_stats[k])
                 if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
+                    best_stat['epoch'] = epoch if current_value > best_stat[k] else best_stat['epoch']
+                    best_stat[k] = max(best_stat[k], current_value)
                 else:
                     best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+                    best_stat[k] = current_value
 
                 if best_stat[k] > top1:
                     best_stat_print['epoch'] = epoch
@@ -185,11 +228,11 @@ class DetSolver(BaseSolver):
 
                 if best_stat['epoch'] == epoch and self.output_dir:
                     if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if test_stats[k][0] > top1:
+                        if current_value > top1:
                             top1 = test_stats[k][0]
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
                     else:
-                        top1 = max(test_stats[k][0], top1)
+                        top1 = max(current_value, top1)
                         dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
 
                 elif epoch >= self.train_dataloader.collate_fn.stop_epoch:

@@ -4,8 +4,52 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..core import register
+
+
+def _reduce(loss, reduction):
+    if reduction == 'mean':
+        return loss.mean()
+    if reduction == 'sum':
+        return loss.sum()
+    return loss
+
+
+@register()
+class L1Loss(nn.Module):
+    """MMLab-style L1 loss used by the keypoint coordinate branch."""
+    def __init__(self, reduction='mean', loss_weight=1.0):
+        super().__init__()
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError(f'Unsupported reduction: {reduction}')
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+
+    def forward(self, output, target):
+        return _reduce(F.l1_loss(output, target, reduction='none'),
+                       self.reduction) * self.loss_weight
+
+
+@register()
+class CrossEntropyLoss(nn.Module):
+    """Sigmoid cross-entropy compatible with the MMLab loss configuration."""
+    def __init__(self, use_sigmoid=False, reduction='mean', loss_weight=1.0):
+        super().__init__()
+        if not use_sigmoid:
+            raise ValueError(
+                'Keypoint visibility requires CrossEntropyLoss(use_sigmoid=True)')
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError(f'Unsupported reduction: {reduction}')
+        self.use_sigmoid = use_sigmoid
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+
+    def forward(self, output, target):
+        loss = F.binary_cross_entropy_with_logits(
+            output, target.float(), reduction='none')
+        return _reduce(loss, self.reduction) * self.loss_weight
 
 
 @register()
