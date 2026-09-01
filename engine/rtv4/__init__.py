@@ -15,6 +15,6 @@ from .rtdetrv2_decoder import RTDETRTransformerv2
 
 from .postprocessor import PostProcessor
 from .rtv4_criterion import RTv4Criterion
-from .keypoint_loss import OKSLoss
+from .keypoint_loss import CrossEntropyLoss, L1Loss, OKSLoss
 
 from .dinov3_teacher import DINOv3TeacherModel

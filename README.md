@@ -248,43 +248,73 @@ torchrun --nproc_per_node=1 train.py \
 Evaluate a checkpoint:
 
 ```shell
-torchrun --nproc_per_node=1 train.py \
+python train.py \
   -c configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml \
   -r /absolute/path/to/checkpoint.pth \
-  --test-only
+  --test-only \
+  --eval-batch-size 1 \
+  --device cuda:0
 ```
+
+This runs the model in evaluation mode over the complete `val_dataloader.dataset`
+declared by the input config. `--eval-batch-size` defaults to `1` and overrides
+the validation loader's configured `batch_size` or `total_batch_size`. The
+validation path loads the detector checkpoint without loading the distillation
+teacher model. Edit `val_dataloader.dataset.img_folder` and
+`val_dataloader.dataset.ann_file` in the config to select the validation set.
+
+To export validation predictions, metrics, and optional original-resolution
+visualizations, use the dedicated inference script:
+
+```shell
+python tools/inference/validation_inference.py \
+  --config configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints.yml \
+  --checkpoint /absolute/path/to/checkpoint.pth \
+  --output-dir /absolute/path/to/inference_output \
+  --device cuda:0 \
+  --batch-size 1 \
+  --score-threshold 0.4 \
+  --keypoint-threshold 0.5 \
+  --save-visualizations
+```
+
+The script evaluates the config's complete validation dataset and writes
+`predictions.json`, `metrics.txt`, and (when requested) `visualizations/1.jpg`,
+`visualizations/2.jpg`, and so on. Bounding boxes and keypoints are mapped to
+the original image coordinates, and each visualization retains its source
+image dimensions.
 
 #### Training with multiple COCO datasets
 
 For five training datasets, use
 [`configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml`](./configs/rtv4/rtv4_hgnetv2_s_vehicle_keypoints_5datasets.yml).
-Edit the five entries in `img_folders` and `ann_files`. All datasets must use
+Edit `img_folder` and `ann_file` in each nested dataset. All datasets must use
 the same class names and the same 31-keypoint ordering. Category ids and category
-order may differ because they are remapped by name through `class_names`. The included
-`MultiDataSampler` draws 300,000 samples per global epoch with the requested
-`[25, 35, 15, 15, 10]` percentage ratio:
+order may differ because they are remapped by name through `class_names`. The
+included `WeightedMultiDataset` draws 50,000 samples per virtual epoch using
+the configured probabilities:
 
 ```yaml
 train_dataloader:
-  shuffle: False
-  sampler:
-    type: MultiDataSampler
-    dataset_ratio: [25, 35, 15, 15, 10]
-    max_samples: 300000
+  shuffle: True
   dataset:
-    type: MultiCocoDetection
-    img_folders: [/data/a/train, /data/b/train, /data/c/train, /data/d/train, /data/e/train]
-    ann_files: [/data/a/train.json, /data/b/train.json, /data/c/train.json,
-                /data/d/train.json, /data/e/train.json]
-    repeat_factors: [1, 1, 1, 1, 1]
+    type: WeightedMultiDataset
+    weights: [0.35, 0.25, 0.20, 0.12, 0.08]
+    samples_per_epoch: 50000
+    seed: 42
+    datasets:
+      - {type: CocoDetection, img_folder: /data/a/train, ann_file: /data/a/train.json, transforms: null, num_keypoints: 31}
+      - {type: CocoDetection, img_folder: /data/b/train, ann_file: /data/b/train.json, transforms: null, num_keypoints: 31}
+      # Add the remaining three CocoDetection entries in the same form.
 
 num_classes: 5
 class_names: [car, truck, bus, motorcycle, bicycle]
 ```
 
-The ratios are normalized, so they may also be written as decimal weights.
-Sampling within each source dataset is with replacement. Keep
-`repeat_factors: [1, 1, 1, 1, 1]` because the sampler controls balancing.
+The weights are normalized automatically. Dataset and image selection are both
+with replacement, and `seed + epoch` determines the reproducible epoch mapping.
+Child transforms stay `null`; the wrapper receives and applies the shared
+training transform pipeline from the included vehicle-keypoint config.
 Use one stable validation dataset in `val_dataloader` so metrics remain directly
 comparable between epochs.
 

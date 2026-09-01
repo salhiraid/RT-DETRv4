@@ -18,6 +18,15 @@ from engine.solver import TASKS
 
 debug=False
 
+
+def configure_evaluation(cfg, batch_size):
+    """Force validation-only runs to use the requested per-process batch size."""
+    if batch_size <= 0:
+        raise ValueError('--eval-batch-size must be positive')
+    loader_cfg = cfg.yaml_cfg['val_dataloader']
+    loader_cfg.pop('total_batch_size', None)
+    loader_cfg['batch_size'] = int(batch_size)
+
 if debug:
     import torch
     def custom_repr(self):
@@ -36,9 +45,12 @@ def main(args, ) -> None:
 
     update_dict = yaml_utils.parse_cli(args.update)
     update_dict.update({k: v for k, v in args.__dict__.items() \
-        if k not in ['update', ] and v is not None})
+        if k not in ['update', 'eval_batch_size'] and v is not None})
 
     cfg = YAMLConfig(args.config, **update_dict)
+
+    if args.test_only:
+        configure_evaluation(cfg, getattr(args, 'eval_batch_size', 1))
 
     if args.resume or args.tuning:
         if 'HGNetv2' in cfg.yaml_cfg:
@@ -70,6 +82,9 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', type=str, help='output directoy')
     parser.add_argument('--summary-dir', type=str, help='tensorboard summry')
     parser.add_argument('--test-only', action='store_true', default=False,)
+    parser.add_argument(
+        '--eval-batch-size', type=int, default=1,
+        help='per-process validation batch size used with --test-only (default: 1)')
 
     # priority 1
     parser.add_argument('-u', '--update', nargs='+', help='update yaml config')

@@ -44,7 +44,7 @@ class BaseSolver(object):
             50, 25, 75, 98, 153, 37, 73, 115, 132, 106, 61, 163, 134, 277, 81, 133, 18, 94, 30,
             169, 70, 328, 226
         ]
-    def _setup(self):
+    def _setup(self, load_teacher=True):
         """Avoid instantiating unnecessary classes"""
         cfg = self.cfg
         if cfg.device:
@@ -55,7 +55,9 @@ class BaseSolver(object):
         self.model = cfg.model
 
         # Setup teacher model
-        self.teacher_model = to(cfg.teacher_model, device)
+        # The teacher participates only in training-time distillation. Avoid
+        # loading its repository and checkpoint during validation inference.
+        self.teacher_model = to(cfg.teacher_model, device) if load_teacher else None
 
         # NOTE: Must load_tuning_state before EMA instance building
         if self.cfg.tuning:
@@ -109,7 +111,7 @@ class BaseSolver(object):
             self.load_resume_state(self.cfg.resume)
 
     def eval(self):
-        self._setup()
+        self._setup(load_teacher=False)
 
         self.val_dataloader = dist_utils.warp_loader(
             self.cfg.val_dataloader, shuffle=self.cfg.val_dataloader.shuffle
