@@ -117,6 +117,17 @@ class YAMLConfig(BaseConfig):
         return super().train_dataloader
 
     @property
+    def batch_augments(self):
+        if self._batch_augments is None:
+            self._batch_augments = [
+                create(augment['type'], self.global_cfg, **{
+                    key: value for key, value in augment.items() if key != 'type'
+                })
+                for augment in self.yaml_cfg.get('batch_augments', [])
+            ]
+        return self._batch_augments
+
+    @property
     def val_dataloader(self, ) -> DataLoader:
         if self._val_dataloader is None and 'val_dataloader' in self.yaml_cfg:
             self._val_dataloader = self.build_dataloader('val_dataloader')

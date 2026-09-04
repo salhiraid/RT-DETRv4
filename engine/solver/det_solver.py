@@ -75,7 +75,8 @@ class DetSolver(BaseSolver):
 
         self.self_lr_scheduler = False
         if args.lrsheduler is not None:
-            iter_per_epoch = len(self.train_dataloader)
+            iter_per_epoch = math.ceil(
+                len(self.train_dataloader) / args.accumulate_steps)
             print("     ## Using Self-defined Scheduler-{} ## ".format(args.lrsheduler))
             self.lr_scheduler = FlatCosineLRScheduler(self.optimizer, args.lr_gamma, iter_per_epoch, total_epochs=args.epoches,
                                                 warmup_iter=args.warmup_iter, flat_epochs=args.flat_epoch, no_aug_epochs=args.no_aug_epoch)
@@ -133,6 +134,8 @@ class DetSolver(BaseSolver):
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
                 writer=self.writer,
                 teacher_model=self.teacher_model, # NEW: Pass teacher model to train_one_epoch
+                batch_augments=args.batch_augments,
+                accumulate_steps=args.accumulate_steps,
             )
 
             if not self.self_lr_scheduler:  # update by epoch 

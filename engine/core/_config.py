@@ -88,6 +88,12 @@ class BaseConfig(object):
 
         # distillation: General distillation control switch
         self._teacher_model: nn.Module = None
+        self._batch_augments = None
+        self.accumulate_steps: int = 1
+
+    @property
+    def batch_augments(self):
+        return self._batch_augments
 
     @property
     def model(self, ) -> nn.Module:
