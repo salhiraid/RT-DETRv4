@@ -657,3 +657,33 @@ If you find this work helpful, please consider citing:
 
 Our work is built upon [RT-DETR](https://github.com/lyuwenyu/RT-DETR), [D-FINE](https://github.com/Peterande/D-FINE), [DEIM](https://github.com/Intellindust-AI-Lab/DEIM) and Teacher Model [DINOv3](https://github.com/facebookresearch/dinov3).
 Thanks to these remarkable works!
+
+### Synchronized multi-resolution training and gradient accumulation
+
+Batch resizing runs after a batch is moved to the training device, so the sampled
+shape can be broadcast safely during distributed training. Add the following
+keys to a training config (and disable the collate function's older per-batch
+multi-scale resize by setting `base_size_repeat: null`):
+
+```yaml
+train_dataloader:
+  collate_fn:
+    base_size_repeat: null
+
+batch_augments:
+  - type: BatchSyncRandomResize
+    random_size_range: [480, 1536]
+    size_divisor: 32
+    interval: 10
+    interpolations: bilinear
+
+# Effective batch size = total_batch_size * accumulate_steps.
+accumulate_steps: 4
+```
+
+`random_sizes: [480, 640, 800]` can be used instead of
+`random_size_range`. Exactly one form must be configured. The selected height,
+derived aspect-ratio-preserving width, and interpolation mode are synchronized
+across distributed ranks and retained for `interval` micro-batches. Optimizer,
+EMA, warm-up scheduler, and gradient clipping updates happen only after each
+complete accumulation window.
