@@ -1,0 +1,40 @@
+__include__: [
+  './rtv4_hgnetv2_s_vehicle_keypoints.yml'
+]
+
+# -----------------------------------------------------------------------------
+# Synchronized multi-scale (random batch resize) training.
+#
+# BatchSyncRandomResize runs on the training device, after a batch has already
+# been collated, so every rank resizes to the same sampled shape during
+# distributed training. It complements (and replaces) the dataset-side fixed
+# Resize below: the CPU pipeline still resizes every sample to a common
+# `eval_spatial_size`-sized tensor so batching works, and this hook then
+# re-samples a new (aspect-ratio-preserving) resolution every `interval`
+# iterations, uniformly at random within `random_size_range`.
+#
+# The older per-batch multi-scale resize done inside the collate function must
+# stay disabled (`base_size_repeat: null`, already the case in the included
+# vehicle-keypoints config) so the two multi-scale mechanisms don't conflict.
+# -----------------------------------------------------------------------------
+output_dir: ./outputs/rtv4_hgnetv2_s_vehicle_keypoints_random_batch_resize
+
+train_dataloader:
+  collate_fn:
+    base_size_repeat: ~
+
+BatchSyncRandomResize:
+  random_size_range: [480, 896]
+  size_divisor: 32
+  interval: 10
+  interpolations: bilinear
+
+batch_augments:
+  - type: BatchSyncRandomResize
+
+# Effective batch size = train_dataloader.total_batch_size * accumulate_steps.
+# Larger sampled resolutions from BatchSyncRandomResize increase peak memory
+# use; gradient accumulation keeps the effective batch size stable without
+# raising the per-step memory footprint. Lower this back to 1 if your GPUs
+# have enough headroom to take every random scale at the configured batch size.
+accumulate_steps: 2
