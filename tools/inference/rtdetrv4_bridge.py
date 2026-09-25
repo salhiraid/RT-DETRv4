@@ -250,8 +250,10 @@ def predict(args):
         outputs = {k: v.float() if torch.is_tensor(v) else v for k, v in outputs.items()}
         results = postprocessor(outputs, orig_sizes)
         for (img_info, img_path, _, orig_hw), result in zip(batch, results):
+            # Keep all queries (like the repo's validation); --score-threshold is
+            # applied when building the COCO list, as filter_predictions() does.
             predictions.append(to_record(img_info, img_path, orig_hw, input_size, result,
-                                         args.score_threshold, label_map))
+                                         0.0, label_map))
         batch.clear()
 
     for index, img_info in enumerate(images, start=1):
@@ -451,6 +453,53 @@ def print_summary(results, mode, cat_id_to_name=None):
                   f'AP75={stats[2]:.3f} AR={stats[8]:.3f}')
 
 
+# ── Repo / TensorBoard metrics on the same predictions ────────────────────────
+
+def tensorboard_metrics(records, label_names, gt_file, evaluator_cfg):
+    """Evaluate ``records`` with the repo's VehicleCocoEvaluator (the TensorBoard metric).
+
+    Uses every stored query, like engine/solver/det_engine.evaluate(). Keypoint
+    distances are in original-image pixels here, whereas the toolkit's
+    evaluate_keypoints() measures them in a 512x512 crop of the GT box, so only
+    bbox AP/AR and visibility metrics are comparable between the two.
+    """
+    import contextlib
+    import io
+    from faster_coco_eval import COCO as FasterCOCO
+    from engine.data.dataset.coco_eval import VehicleCocoEvaluator
+
+    params = {k: v for k, v in (evaluator_cfg or {}).items()
+              if k in ('num_keypoints', 'thresholds', 'iou_thr', 'vis_thr', 'score_thr',
+                       'margin', 'crop_size', 'min_bbox_size')}
+    predictions = {}
+    for record in records:
+        instances = record['pred_instances']
+        result = {
+            'boxes': torch.as_tensor(instances['bboxes']),
+            'scores': torch.as_tensor(instances['scores']),
+            'labels': torch.as_tensor(instances['labels']),
+        }
+        if instances.get('keypoints') is not None:
+            result['keypoints'] = torch.as_tensor(instances['keypoints'])
+            result['keypoint_scores'] = torch.as_tensor(instances['keypoint_scores'])
+        predictions[record['img_id']] = result
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        evaluator = VehicleCocoEvaluator(FasterCOCO(str(gt_file)), iou_types=['bbox'],
+                                         class_names=label_names, **params)
+        evaluator.update(predictions)
+        evaluator.synchronize_between_processes()
+        evaluator.accumulate()
+        evaluator.summarize()
+
+    names = ('AP', 'AP50', 'AP75', 'AP_S', 'AP_M', 'AP_L',
+             'AR_1', 'AR_10', 'AR_100', 'AR_S', 'AR_M', 'AR_L')
+    metrics = {f'bbox_{n}': float(v)
+               for n, v in zip(names, evaluator.coco_eval['bbox'].stats.tolist())}
+    metrics.update({f'keypoints_{k}': float(v) for k, v in evaluator.vehicle_metrics.items()})
+    return metrics
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def resolve_out_dir(args):
@@ -515,6 +564,23 @@ def run(args):
     # ── 3. results_cache_dual.pkl ──
     if eval_utils is None:
         return str(pkl_path)
+
+    # Same predictions through the repo's own evaluator, to check against TensorBoard.
+    gt_ids = {img['id'] for img in gt_data['images'][:args.max_samples]}
+    tb = tensorboard_metrics([r for r in records if r['img_id'] in gt_ids], label_names,
+                             gt_file, load_yaml(args.config).yaml_cfg.get('evaluator'))
+    tb_path = out_dir / 'tensorboard_metrics.json'
+    with open(tb_path, 'w') as f:
+        json.dump(tb, f, indent=2)
+    print('\n── Repo evaluator (TensorBoard metric) on the same predictions ──')
+    for name, value in tb.items():
+        print(f'  {name:36s} {value:.4f}')
+    print(f'TensorBoard metrics saved → {tb_path}')
+
+    if not preds:
+        print(f'No detections with score >= {args.score_threshold}: skipping the toolkit '
+              'evaluation (pycocotools cannot load an empty result list)')
+        return str(pkl_path)
     vehicle_cat_ids = [ds_cat_name_to_id[n] for n in label_names if n in ds_cat_name_to_id]
     coco_gt = COCO(gt_file)
     evaluate_and_cache(eval_utils, preds, coco_gt, vehicle_cat_ids, ds_cat_id_to_name,
@@ -531,7 +597,8 @@ def build_parser():
     model.add_argument('-d', '--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
     model.add_argument('-b', '--batch-size', type=int, default=1)
     model.add_argument('--score-threshold', type=float, default=0.0,
-                       help='Use the same value as ModelConfig.score_thr')
+                       help='ModelConfig.score_thr; applied to the COCO json / toolkit eval '
+                            '(predictions.pkl keeps all queries)')
     model.add_argument('--input-width', type=int,
                        help='Network input width (default: YAML eval_spatial_size)')
     model.add_argument('--input-height', type=int,
