@@ -33,6 +33,12 @@ Plots and visualizations are left to the toolkit.
         },
     }
 
+The model always runs at the resolution it was trained at: read from the
+checkpoint (its stored decoder anchor grid), cross-checked against the YAML's
+``eval_spatial_size``. ``--input-width/--input-height`` (the toolkit's
+``inference_scale``) are only checked and name the output folder, unless
+``--override-input-size`` is given.
+
 Images are iterated in the order of ``gt['images']`` (``--max-samples`` keeps
 the first N), matching how the evaluation selects ``gt_img_ids``.
 Preprocessing matches the validation pipeline of the vehicle configs:
@@ -91,28 +97,100 @@ def checkpoint_state(checkpoint):
     return checkpoint
 
 
-def load_model(config_path, checkpoint_path, device, input_size=None):
-    """Build model + postprocessor; ``input_size`` is (H, W) or None for the YAML value."""
+def decoder_strides(yaml_cfg):
+    for name in ('DFINETransformer', 'RTDETRTransformerv2'):
+        strides = (yaml_cfg.get(name) or {}).get('feat_strides')
+        if strides:
+            return [int(s) for s in strides]
+    return [8, 16, 32]
+
+
+def anchor_grid(size, strides):
+    return [(int(size[0] / s), int(size[1] / s)) for s in strides]
+
+
+def checkpoint_eval_size(state, strides):
+    """(H, W) the checkpoint's decoder anchors were built for, or None.
+
+    The decoder stores its anchors (one per feature-map cell, per level) as a
+    persistent buffer computed from ``eval_spatial_size``, so the level-0 grid
+    of the checkpoint gives the resolution used when training/evaluating it.
+    """
+    key = next((k for k in state if k.endswith('decoder.anchors')), None)
+    if key is None:
+        return None
+    anchors = torch.sigmoid(state[key].float().reshape(-1, 4))
+    # Level-0 anchors have size 0.05; border anchors are stored as inf (masked),
+    # so derive the grid from the spacing of the centres, (i + 0.5) / w.
+    level0 = (anchors[:, 2] - 0.05).abs() < 1e-3
+    if level0.sum() < 4:
+        return None
+
+    def cells(values):
+        values = torch.unique(torch.round(values * 1e6)) / 1e6
+        return int(round(1.0 / float(torch.diff(values).median()))) if len(values) > 1 else None
+
+    w0, h0 = cells(anchors[level0, 0]), cells(anchors[level0, 1])
+    if not w0 or not h0:
+        return None
+    size = [h0 * strides[0], w0 * strides[0]]
+    expected = sum(h * w for h, w in anchor_grid(size, strides))
+    return size if expected == anchors.shape[0] else None
+
+
+def load_model(config_path, checkpoint_path, device, requested_size=None, override_size=False):
+    """Build model + postprocessor at the checkpoint's training resolution.
+
+    ``requested_size`` (H, W), e.g. from DatasetConfig.inference_scale, is only
+    checked against that resolution unless ``override_size`` is set: DETR-style
+    models are trained at a fixed input size and silently degrade at another.
+    """
     cfg = load_yaml(config_path)
     if 'HGNetv2' in cfg.yaml_cfg:
         cfg.yaml_cfg['HGNetv2']['pretrained'] = False
 
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    source = next((k for k in ('ema', 'model', 'state_dict') if isinstance(checkpoint, dict)
+                   and k in checkpoint), 'raw state dict')
+    state = checkpoint_state(checkpoint)
+    state = {key.removeprefix('module.'): value for key, value in state.items()}
+    print(f'Weights     : {source}' + (f' (updates={checkpoint["ema"].get("updates")})'
+                                         if source == 'ema' and isinstance(checkpoint['ema'], dict)
+                                         else ''))
+
+    strides = decoder_strides(cfg.yaml_cfg)
     yaml_size = cfg.yaml_cfg.get('eval_spatial_size')
-    if input_size is None:
-        if not yaml_size:
-            raise ValueError('Config has no eval_spatial_size; pass --input-width/--input-height')
-        input_size = list(yaml_size)
-    input_size = [int(input_size[0]), int(input_size[1])]
-    if yaml_size and list(yaml_size) != input_size:
-        print(f'eval_spatial_size override: {list(yaml_size)} -> {input_size} (H, W)')
+    ckpt_size = checkpoint_eval_size(state, strides)
+    # The anchor grid pins the size down to a multiple of the first stride, so
+    # keep the YAML's exact value whenever it produces the same grid.
+    trained_size = list(yaml_size) if yaml_size else ckpt_size
+    if ckpt_size and yaml_size and anchor_grid(yaml_size, strides) != anchor_grid(ckpt_size, strides):
+        trained_size = ckpt_size
+        print(f'WARNING: the config says eval_spatial_size={list(yaml_size)} but the checkpoint '
+              f'was built for {ckpt_size} (H, W). This config is not the one used for '
+              f'training; running at the checkpoint resolution {ckpt_size}. Pass the training '
+              f'YAML to be sure the rest of the config matches too.')
+
+    run_size = trained_size
+    if requested_size is not None:
+        requested_size = [int(requested_size[0]), int(requested_size[1])]
+        if run_size is None or override_size:
+            if run_size is not None and requested_size != run_size:
+                print(f'WARNING: --override-input-size: running at {requested_size} instead of '
+                      f'the training resolution {run_size}; accuracy will differ from training')
+            run_size = requested_size
+        elif requested_size != run_size:
+            print(f'WARNING: requested input {requested_size} (H, W) differs from the training '
+                  f'resolution {run_size}; ignoring it (pass --override-input-size to force)')
+    if run_size is None:
+        raise ValueError('No eval_spatial_size in the config or checkpoint; '
+                         'pass --input-width/--input-height')
+    run_size = [int(run_size[0]), int(run_size[1])]
     # Shared with HybridEncoder / DFINETransformer so anchors and positional
-    # embeddings are built for the requested resolution.
-    cfg.yaml_cfg['eval_spatial_size'] = input_size
+    # embeddings are built for the resolution the model runs at.
+    cfg.yaml_cfg['eval_spatial_size'] = run_size
 
     model = cfg.model
-    state = checkpoint_state(torch.load(checkpoint_path, map_location='cpu', weights_only=False))
-    state = {key.removeprefix('module.'): value for key, value in state.items()}
-
     model_state = model.state_dict()
     for key in list(state):
         if (key.rsplit('.', 1)[-1] in SIZE_DEPENDENT_BUFFERS and key in model_state
@@ -125,15 +203,15 @@ def load_model(config_path, checkpoint_path, device, input_size=None):
     # Cached decoder anchors use int(size / stride), but the backbone produces
     # ceil(size / stride) cells when the size is not a multiple of the largest
     # stride (e.g. 666). Build anchors from the real feature shapes instead.
-    if any(size % MAX_STRIDE for size in input_size):
-        print(f'Input {input_size} is not a multiple of {MAX_STRIDE}: '
+    if any(size % MAX_STRIDE for size in run_size):
+        print(f'Input {run_size} is not a multiple of {MAX_STRIDE}: '
               'using anchors generated from the actual feature-map shapes')
         for module in model.modules():
             if hasattr(module, '_generate_anchors') and hasattr(module, 'eval_spatial_size'):
                 module.eval_spatial_size = None
 
     postprocessor = cfg.postprocessor
-    return model.to(device).eval(), postprocessor.to(device).eval(), cfg, input_size
+    return model.to(device).eval(), postprocessor.to(device).eval(), cfg, run_size
 
 
 def resolve_dataset(cfg, gt_file=None, img_root=None):
@@ -217,8 +295,11 @@ def predict(args):
             raise ValueError('Pass both --input-width and --input-height')
         input_size = [args.input_height, args.input_width]
 
+    if args.fp16:
+        print('WARNING: --fp16 runs the model under float16 autocast; the training '
+              'validation (TensorBoard) runs in float32')
     model, postprocessor, cfg, input_size = load_model(
-        args.config, args.checkpoint, device, input_size)
+        args.config, args.checkpoint, device, input_size, args.override_input_size)
     model_classes = cfg.yaml_cfg.get('class_names')
     label_map = build_label_map(model_classes, args.class_order)
     gt_file, img_root = resolve_dataset(cfg, args.gt_file, args.img_root)
@@ -600,9 +681,13 @@ def build_parser():
                        help='ModelConfig.score_thr; applied to the COCO json / toolkit eval '
                             '(predictions.pkl keeps all queries)')
     model.add_argument('--input-width', type=int,
-                       help='Network input width (default: YAML eval_spatial_size)')
-    model.add_argument('--input-height', type=int,
-                       help='Network input height (default: YAML eval_spatial_size)')
+                       help='Expected input width (DatasetConfig.inference_scale): checked '
+                            'against the training resolution and used for the output folder '
+                            'name; only resizes with --override-input-size')
+    model.add_argument('--input-height', type=int, help='Expected input height (see --input-width)')
+    model.add_argument('--override-input-size', action='store_true',
+                       help='Really run at --input-width/--input-height instead of the '
+                            'checkpoint training resolution')
     model.add_argument('--class-order', nargs='+',
                        help='Class names in the evaluation label order (MODEL_CLASSES); '
                             'pkl labels are remapped by name. Default: YAML class_names')
