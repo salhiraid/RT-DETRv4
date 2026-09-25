@@ -180,7 +180,8 @@ def to_record(img_info, img_path, orig_hw, input_size, result, score_threshold,
 
 
 @torch.inference_mode()
-def run(args):
+def predict(args):
+    """Run inference; return (records, class names indexed by record label)."""
     device = torch.device(args.device)
     input_size = None
     if args.input_width is not None or args.input_height is not None:
@@ -241,7 +242,12 @@ def run(args):
 
     if skipped:
         print(f'Warning: {skipped} images not found on disk')
+    label_names = list(args.class_order) if label_map is not None else model_classes
+    return predictions, label_names
 
+
+def run(args):
+    predictions, _ = predict(args)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, 'wb') as f:
@@ -251,12 +257,12 @@ def run(args):
     return str(output)
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__,
+def build_parser(description=__doc__, require_model=True, output_help='Output .pkl path'):
+    parser = argparse.ArgumentParser(description=description,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('-c', '--config', required=True)
-    parser.add_argument('-r', '--checkpoint', required=True)
-    parser.add_argument('-o', '--output', required=True, help='Output .pkl path')
+    parser.add_argument('-c', '--config', required=require_model)
+    parser.add_argument('-r', '--checkpoint', required=require_model)
+    parser.add_argument('-o', '--output', required=True, help=output_help)
     parser.add_argument('-d', '--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('-b', '--batch-size', type=int, default=1)
     parser.add_argument('--score-threshold', type=float, default=0.0)
@@ -271,7 +277,11 @@ def parse_args(argv=None):
                         help='Class names in the evaluation label order (e.g. MODEL_CLASSES); '
                              'model labels are remapped by name. Default: YAML class_names order')
     parser.add_argument('--fp16', action='store_true')
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 if __name__ == '__main__':
