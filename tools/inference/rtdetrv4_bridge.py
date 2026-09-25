@@ -1,9 +1,21 @@
-"""Export RT-DETRv4 predictions in the mmdet-style ``predictions.pkl`` layout.
+"""RT-DETRv4 inference + evaluation bridge for the external eval toolkit.
 
-The output is a pickled list with one record per image, identical in schema
-to the ``run_inference()`` / TRT / ONNX paths of the external evaluation
-toolkit, so ``pkl_to_coco()`` and the evaluation scripts can consume it
-unchanged::
+Writes the same three files ``main.py`` of the evaluation toolkit produces in a
+dataset output folder (``<OUT_DIR>/<model_name>/<dataset>@<W>x<H>/``)::
+
+    predictions.pkl               mmdet-style records (schema below)
+    predictions_class_aware.json  COCO results list (pkl_to_coco + filter_predictions)
+    results_cache_dual.pkl        {'version': 2, 'results': {'class_aware': ...,
+                                   'class_agnostic': ...}, 'preds': [...]}
+
+plus ``class_aware/`` and ``class_agnostic/bbox_metrics_and_errors.json``.
+``main.py`` then finds the complete cache and does not run anything again.
+Evaluation uses ``eval_toolkit/evaluation.py`` (a port of the toolkit's
+``evaluation.py``) or, with ``--eval-toolkit DIR``, the toolkit's own module.
+Plots and visualizations are left to the toolkit.
+
+``predictions.pkl`` has one record per image, identical in schema to the
+``run_inference()`` / TRT / ONNX paths of the toolkit::
 
     {
         'img_id':       int,                      # COCO image id from the GT json
@@ -28,6 +40,7 @@ PIL RGB -> Resize(H, W) (no keep-ratio) -> float in [0, 1].
 """
 
 import argparse
+import importlib
 import json
 import os
 import pickle
@@ -40,8 +53,20 @@ import torchvision.transforms.v2.functional as F
 from PIL import Image, ImageFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from engine.core import YAMLConfig
+# NOTE: ``engine`` is imported lazily (load_yaml). Importing it runs
+# faster_coco_eval.init_as_pycocotools(), which swaps the ``pycocotools``
+# modules; the evaluation module must bind the real pycocotools first.
+
+CACHE_VERSION = 2
+EVAL_MODES = ('class_aware', 'class_agnostic')
+AGNOSTIC_CAT_ID = 9999
+
+
+def load_yaml(config_path):
+    from engine.core import YAMLConfig
+    return YAMLConfig(str(config_path))
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -68,7 +93,7 @@ def checkpoint_state(checkpoint):
 
 def load_model(config_path, checkpoint_path, device, input_size=None):
     """Build model + postprocessor; ``input_size`` is (H, W) or None for the YAML value."""
-    cfg = YAMLConfig(str(config_path))
+    cfg = load_yaml(config_path)
     if 'HGNetv2' in cfg.yaml_cfg:
         cfg.yaml_cfg['HGNetv2']['pretrained'] = False
 
@@ -179,9 +204,12 @@ def to_record(img_info, img_path, orig_hw, input_size, result, score_threshold,
     }
 
 
+
+# ── Inference ─────────────────────────────────────────────────────────────────
+
 @torch.inference_mode()
 def predict(args):
-    """Run inference; return (records, class names indexed by record label)."""
+    """Run inference; return (records, class names by record label, gt_file)."""
     device = torch.device(args.device)
     input_size = None
     if args.input_width is not None or args.input_height is not None:
@@ -243,40 +271,301 @@ def predict(args):
     if skipped:
         print(f'Warning: {skipped} images not found on disk')
     label_names = list(args.class_order) if label_map is not None else model_classes
-    return predictions, label_names
+    return predictions, label_names, gt_file
+
+
+# ── pkl -> class-aware COCO list (toolkit: pkl_to_coco + filter_predictions) ──
+
+def records_to_coco(records, label_names, cat_name_to_id, score_threshold, gt_img_ids):
+    """Flatten pkl records into a class-aware COCO results list.
+
+    Labels are mapped to GT category ids by class name. Keypoints are flat
+    ``[x, y, v, ...]`` with ``v = sigmoid(visibility)``, as the toolkit expects.
+    """
+    coco, unmapped = [], {}
+    for record in records:
+        if record['img_id'] not in gt_img_ids:
+            continue
+        instances = record['pred_instances']
+        keypoints = instances.get('keypoints')
+        visible = instances.get('keypoints_visible')
+        keypoint_scores = instances.get('keypoint_scores')
+        for index, score in enumerate(instances['scores']):
+            score = float(score)
+            if score < score_threshold:
+                continue
+            name = label_names[int(instances['labels'][index])]
+            if name not in cat_name_to_id:
+                unmapped[name] = unmapped.get(name, 0) + 1
+                continue
+            x1, y1, x2, y2 = (float(v) for v in instances['bboxes'][index])
+            prediction = {
+                'image_id': record['img_id'],
+                'category_id': cat_name_to_id[name],
+                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                'score': score,
+                'img_path': record['img_path'],
+            }
+            if keypoints is not None:
+                prediction['keypoints'] = [
+                    float(value)
+                    for (x, y), v in zip(keypoints[index], visible[index])
+                    for value in (x, y, v)
+                ]
+                prediction['keypoint_scores'] = [float(v) for v in keypoint_scores[index]]
+            coco.append(prediction)
+    if unmapped:
+        print(f'Warning: dropped detections of classes absent from the GT file: {unmapped}')
+    return coco
+
+
+# ── Dual evaluation (toolkit main.py: _evaluate_and_cache, without plots) ─────
+
+def load_eval_module(toolkit_dir, max_dets, kpt_names):
+    """Import the toolkit's evaluation.py (``toolkit_dir``) or the bundled port."""
+    if toolkit_dir:
+        sys.path.insert(0, str(Path(toolkit_dir).resolve()))
+        module = importlib.import_module('evaluation')
+    else:
+        module = importlib.import_module('eval_toolkit.evaluation')
+        module.MAX_DETS = max_dets
+        module.KPT_NAMES = kpt_names
+    if not module.COCOeval.__module__.startswith('pycocotools'):
+        print(f'Warning: evaluation uses {module.COCOeval.__module__}.COCOeval, '
+              'not pycocotools; install pycocotools for identical metrics')
+    print(f'Evaluation  : {module.__file__} (MAX_DETS={module.MAX_DETS})')
+    return module
+
+
+def evaluate_and_cache(eval_utils, preds, coco_gt, vehicle_cat_ids, ds_cat_id_to_name,
+                       args, out_dir, cache_path):
+    """Evaluate the class-aware ``preds`` in both modes and save the dual cache."""
+    ag_preds, ag_gt = eval_utils.make_class_agnostic(
+        preds, coco_gt, group_ids=vehicle_cat_ids)
+
+    mode_data = {
+        'class_aware': (preds, coco_gt, vehicle_cat_ids, ds_cat_id_to_name),
+        'class_agnostic': (ag_preds, ag_gt, [AGNOSTIC_CAT_ID], {AGNOSTIC_CAT_ID: 'vehicle'}),
+    }
+
+    results = {}
+    for mode, (mode_preds, mode_gt, cat_ids, cat_id_to_name) in mode_data.items():
+        mode_out = os.path.join(out_dir, mode)
+        os.makedirs(mode_out, exist_ok=True)
+        print(f'\n{"=" * 25} {mode.upper()} {"=" * 25}')
+
+        res = eval_utils.evaluate_bbox(mode_preds, cat_ids, mode_gt, extended_sizes=True)
+        res['error_stats'] = eval_utils.evaluate_bbox_errors(mode_preds, cat_ids, mode_gt)
+        res['occlusion_stats'] = eval_utils.evaluate_bbox_by_occlusion(
+            mode_preds, cat_ids, mode_gt)
+        res['kpt_names'] = args.kpt_names
+
+        evaluate_keypoints_for_mode(eval_utils, res, mode_preds, mode_gt, cat_ids, args)
+        save_bbox_metrics_json(res, mode_out)
+        print_summary(res, mode, cat_id_to_name)
+        results[mode] = res
+
+    with open(cache_path, 'wb') as f:
+        pickle.dump({'version': CACHE_VERSION, 'results': results, 'preds': preds}, f)
+    print(f'Dual cache saved → {cache_path}')
+    return results
+
+
+def evaluate_keypoints_for_mode(eval_utils, results, preds, coco_gt, cat_ids, args):
+    gt_has_keypoints = any(
+        a.get('num_keypoints', 0) > 0
+        for a in coco_gt.loadAnns(coco_gt.getAnnIds()))
+
+    if not any('keypoints' in p for p in preds):
+        print('── No keypoints in predictions — skipping KP eval ──')
+        return
+    if not gt_has_keypoints:
+        print('── No GT keypoint annotations — skipping KP eval ──')
+        return
+
+    print('\n── Keypoint evaluation ───────────────────────────────')
+    kp_results = eval_utils.evaluate_keypoints(
+        preds=preds,
+        coco_gt=coco_gt,
+        cat_ids=cat_ids,
+        thresholds=[5.0, 10.0],
+        vis_thr=0.5,
+        conf_thrs=args.kp_conf_thrs,
+        model_type=args.model_type,
+        margin=0.05,
+        crop_size=512,
+        kpt_names=args.kpt_names,
+    )
+    results['kp'] = {
+        k: v for k, v in kp_results.items()
+        if k not in ('coco_eval', 'coco_dt')
+    }
+
+
+def save_bbox_metrics_json(results, out_dir):
+    payload = {
+        key: results.get(key)
+        for key in ('stats', 'per_cat', 'size_stats', 'per_cat_size_stats',
+                    'error_stats', 'occlusion_stats')
+    }
+    path = os.path.join(out_dir, 'bbox_metrics_and_errors.json')
+    with open(path, 'w') as f:
+        json.dump(_jsonable(payload), f, indent=2)
+    print(f'Metrics JSON saved → {path}')
+
+
+def _jsonable(obj):
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if hasattr(obj, 'tolist'):
+        return obj.tolist()
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def print_summary(results, mode, cat_id_to_name=None):
+    s = results['stats']
+    print(f'\n── {mode} summary ──')
+    print(f'AP@0.50:0.95={s[0]:.3f}  AP@0.50={s[1]:.3f}  AP@0.75={s[2]:.3f}')
+    if results.get('size_stats'):
+        print('Custom sizes: ' + '  '.join(
+            f'{name}={results["size_stats"][name]["ap"]:.3f}'
+            for name in ['small', 'medium', 'large', 'xlarge', 'xxlarge']
+            if name in results['size_stats']))
+    print(f'AR@1={s[6]:.3f}  AR@10={s[7]:.3f}  AR@MAX={s[8]:.3f}')
+    err = results.get('error_stats', {}).get('iou', {})
+    for thr in ('0.50', '0.75'):
+        if thr not in err:
+            continue
+        d = err[thr]['all']
+        print(f'IoU={thr}: TP={d["tp"]} FP={d["fp"]} FN={d["fn"]}  '
+              f'P={d["precision"]:.3f} R={d["recall"]:.3f} F1={d["f1"]:.3f}')
+    if cat_id_to_name and len(results.get('per_cat', {})) > 1:
+        print('Per category:')
+        for cat_id, stats in results['per_cat'].items():
+            print(f'  {cat_id_to_name.get(cat_id, str(cat_id)):12s}  '
+                  f'AP={stats[0]:.3f} AP50={stats[1]:.3f} '
+                  f'AP75={stats[2]:.3f} AR={stats[8]:.3f}')
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def resolve_out_dir(args):
+    """Explicit --out-dir, or <out-root>/<model-name>/<dataset-name>@<W>x<H> like main.py."""
+    if args.out_dir:
+        return Path(args.out_dir)
+    if args.out_root and args.model_name and args.dataset_name:
+        scale = (f'{args.input_width}x{args.input_height}'
+                 if args.input_width and args.input_height else 'default')
+        return Path(args.out_root) / args.model_name / f'{args.dataset_name}@{scale}'
+    if args.output:
+        return Path(args.output).parent
+    raise ValueError('Pass --out-dir, or --out-root + --model-name + --dataset-name')
 
 
 def run(args):
-    predictions, _ = predict(args)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, 'wb') as f:
-        pickle.dump(predictions, f)
-    num_dets = sum(len(p['pred_instances']['scores']) for p in predictions)
-    print(f'Saved {len(predictions)} RT-DETRv4 predictions ({num_dets} detections) -> {output}')
-    return str(output)
+    out_dir = resolve_out_dir(args)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pkl_path = Path(args.output) if args.output else out_dir / 'predictions.pkl'
+    json_path = out_dir / 'predictions_class_aware.json'
+    cache_path = out_dir / 'results_cache_dual.pkl'
+    if not args.config:
+        raise ValueError('--config is required')
+
+    # Must happen before anything imports ``engine`` (see note at the top).
+    eval_utils = None if args.no_eval else load_eval_module(
+        args.eval_toolkit, args.max_dets, args.kpt_names)
+    COCO = eval_utils.COCO if eval_utils else None
+
+    # ── 1. predictions.pkl ──
+    if pkl_path.exists() and not args.force:
+        print(f'Reusing predictions → {pkl_path} (pass --force to rerun inference)')
+        with open(pkl_path, 'rb') as f:
+            records = pickle.load(f)
+        cfg = load_yaml(args.config)
+        label_names = list(args.class_order or cfg.yaml_cfg.get('class_names') or [])
+        gt_file, _ = resolve_dataset(cfg, args.gt_file, args.img_root or '-')
+    else:
+        if not args.checkpoint:
+            raise ValueError('--checkpoint is required to run inference')
+        records, label_names, gt_file = predict(args)
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(records, f)
+        num_dets = sum(len(p['pred_instances']['scores']) for p in records)
+        print(f'Saved {len(records)} RT-DETRv4 predictions ({num_dets} detections) → {pkl_path}')
+    if not label_names:
+        raise ValueError('No class names: add class_names to the YAML or pass --class-order')
+
+    # ── 2. predictions_class_aware.json ──
+    with open(gt_file) as f:
+        gt_data = json.load(f)
+    ds_cat_name_to_id = {c['name']: c['id'] for c in gt_data['categories']}
+    ds_cat_id_to_name = {c['id']: c['name'] for c in gt_data['categories']}
+    gt_img_ids = {img['id'] for img in gt_data['images'][:args.max_samples]}
+
+    preds = records_to_coco(records, label_names, ds_cat_name_to_id,
+                            args.score_threshold, gt_img_ids)
+    with open(json_path, 'w') as f:
+        json.dump(preds, f, indent=2)
+    print(f'Predictions saved → {json_path} ({len(preds)} detections)')
+
+    # ── 3. results_cache_dual.pkl ──
+    if eval_utils is None:
+        return str(pkl_path)
+    vehicle_cat_ids = [ds_cat_name_to_id[n] for n in label_names if n in ds_cat_name_to_id]
+    coco_gt = COCO(gt_file)
+    evaluate_and_cache(eval_utils, preds, coco_gt, vehicle_cat_ids, ds_cat_id_to_name,
+                       args, str(out_dir), str(cache_path))
+    return str(pkl_path)
 
 
-def build_parser(description=__doc__, require_model=True, output_help='Output .pkl path'):
-    parser = argparse.ArgumentParser(description=description,
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('-c', '--config', required=require_model)
-    parser.add_argument('-r', '--checkpoint', required=require_model)
-    parser.add_argument('-o', '--output', required=True, help=output_help)
-    parser.add_argument('-d', '--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('-b', '--batch-size', type=int, default=1)
-    parser.add_argument('--score-threshold', type=float, default=0.0)
-    parser.add_argument('--input-width', type=int,
-                        help='Network input width (default: YAML eval_spatial_size)')
-    parser.add_argument('--input-height', type=int,
-                        help='Network input height (default: YAML eval_spatial_size)')
-    parser.add_argument('--gt-file', help='COCO GT json (default: YAML val ann_file)')
-    parser.add_argument('--img-root', help='Image folder (default: YAML val img_folder)')
-    parser.add_argument('--max-samples', type=int)
-    parser.add_argument('--class-order', nargs='+',
-                        help='Class names in the evaluation label order (e.g. MODEL_CLASSES); '
-                             'model labels are remapped by name. Default: YAML class_names order')
-    parser.add_argument('--fp16', action='store_true')
+    model = parser.add_argument_group('model / inference')
+    model.add_argument('-c', '--config', required=True)
+    model.add_argument('-r', '--checkpoint', help='Required unless predictions.pkl is reused')
+    model.add_argument('-d', '--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
+    model.add_argument('-b', '--batch-size', type=int, default=1)
+    model.add_argument('--score-threshold', type=float, default=0.0,
+                       help='Use the same value as ModelConfig.score_thr')
+    model.add_argument('--input-width', type=int,
+                       help='Network input width (default: YAML eval_spatial_size)')
+    model.add_argument('--input-height', type=int,
+                       help='Network input height (default: YAML eval_spatial_size)')
+    model.add_argument('--class-order', nargs='+',
+                       help='Class names in the evaluation label order (MODEL_CLASSES); '
+                            'pkl labels are remapped by name. Default: YAML class_names')
+    model.add_argument('--fp16', action='store_true')
+    model.add_argument('--force', action='store_true',
+                       help='Rerun inference even if predictions.pkl exists')
+
+    data = parser.add_argument_group('dataset')
+    data.add_argument('--gt-file', help='COCO GT json (default: YAML val ann_file)')
+    data.add_argument('--img-root', help='Image folder (default: YAML val img_folder)')
+    data.add_argument('--max-samples', type=int)
+
+    out = parser.add_argument_group('outputs')
+    out.add_argument('--out-dir', help='Dataset output folder for the three files')
+    out.add_argument('--out-root', help='OUT_DIR of the toolkit (with --model-name/--dataset-name)')
+    out.add_argument('--model-name', help='ModelConfig.name')
+    out.add_argument('--dataset-name', help='DatasetConfig.name')
+    out.add_argument('-o', '--output', help='predictions pkl path (default: <out-dir>/predictions.pkl)')
+
+    ev = parser.add_argument_group('evaluation')
+    ev.add_argument('--no-eval', action='store_true',
+                    help='Only write predictions.pkl and predictions_class_aware.json')
+    ev.add_argument('--eval-toolkit',
+                    help="Folder with the toolkit's evaluation.py/config.py to use instead of "
+                         'the bundled port')
+    ev.add_argument('--max-dets', type=int, default=100, help='config.MAX_DETS of the toolkit')
+    ev.add_argument('--kp-conf-thrs', type=float, nargs='+', default=[0.0],
+                    help='ModelConfig.kp_conf_thrs')
+    ev.add_argument('--kpt-names', nargs='+', help='DatasetConfig.kpt_names')
+    ev.add_argument('--model-type', default='rtdetrv4_external', help='ModelConfig.model_type')
     return parser
 
 
