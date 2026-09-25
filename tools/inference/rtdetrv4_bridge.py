@@ -46,7 +46,9 @@ PIL RGB -> Resize(H, W) (no keep-ratio) -> float in [0, 1].
 """
 
 import argparse
+import contextlib
 import importlib
+import io
 import json
 import os
 import pickle
@@ -138,6 +140,31 @@ def checkpoint_eval_size(state, strides):
     return size if expected == anchors.shape[0] else None
 
 
+def verify_loaded_weights(model, checkpoint, replaced=()):
+    """Check every model tensor against the weights the training validation evaluates.
+
+    The solver evaluates ``ema.module`` when the checkpoint has EMA weights and
+    ``model`` otherwise (engine/solver/det_solver.py); compare bit for bit,
+    reading them straight from the checkpoint.
+    """
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get('ema'), dict):
+        source, reference = 'ema', checkpoint['ema'].get('module', checkpoint['ema'])
+    elif isinstance(checkpoint, dict) and 'model' in checkpoint:
+        source, reference = 'model', checkpoint['model']
+    else:
+        source, reference = 'state dict', checkpoint_state(checkpoint)
+    reference = {k.removeprefix('module.'): v for k, v in reference.items()}
+    loaded = model.state_dict()
+    differ = [k for k, v in loaded.items() if k not in replaced
+              and (k not in reference or not torch.equal(v.cpu(), reference[k].cpu()))]
+    num_params = sum(v.numel() for v in loaded.values())
+    if differ:
+        raise RuntimeError(f'{len(differ)} tensors differ from the checkpoint after loading: '
+                           f'{differ[:10]}')
+    print(f'Weight check: all {len(loaded)} tensors ({num_params / 1e6:.2f}M values) are '
+          f'identical to the checkpoint "{source}" weights')
+
+
 def load_model(config_path, checkpoint_path, device, requested_size=None, override_size=False):
     """Build model + postprocessor at the checkpoint's training resolution.
 
@@ -157,6 +184,9 @@ def load_model(config_path, checkpoint_path, device, requested_size=None, overri
     print(f'Weights     : {source}' + (f' (updates={checkpoint["ema"].get("updates")})'
                                          if source == 'ema' and isinstance(checkpoint['ema'], dict)
                                          else ''))
+    if isinstance(checkpoint, dict):
+        print(f'Checkpoint  : last_epoch={checkpoint.get("last_epoch", "?")}  '
+              f'date={checkpoint.get("date", "?")}  (match this epoch in TensorBoard)')
 
     strides = decoder_strides(cfg.yaml_cfg)
     yaml_size = cfg.yaml_cfg.get('eval_spatial_size')
@@ -192,13 +222,16 @@ def load_model(config_path, checkpoint_path, device, requested_size=None, overri
 
     model = cfg.model
     model_state = model.state_dict()
+    replaced = []
     for key in list(state):
         if (key.rsplit('.', 1)[-1] in SIZE_DEPENDENT_BUFFERS and key in model_state
                 and state[key].shape != model_state[key].shape):
             state[key] = model_state[key]
+            replaced.append(key)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         raise RuntimeError(f'Checkpoint mismatch: missing={missing[:20]} unexpected={unexpected[:20]}')
+    verify_loaded_weights(model, checkpoint, replaced)
 
     # Cached decoder anchors use int(size / stride), but the backbone produces
     # ceil(size / stride) cells when the size is not a multiple of the largest
@@ -354,7 +387,86 @@ def predict(args):
     if skipped:
         print(f'Warning: {skipped} images not found on disk')
     label_names = list(args.class_order) if label_map is not None else model_classes
+    args.run_info = dict(run_size=input_size, img_root=img_root, model_classes=model_classes)
     return predictions, label_names, gt_file
+
+
+# ── Self-check against the repo's validation path ─────────────────────────────
+
+@torch.inference_mode()
+def self_check(args, records, label_names, gt_file, num_images):
+    """Re-run the first ``num_images`` val images through the repo's own validation
+    path (solver.eval() -> load_resume_state -> ema.module -> val dataloader ->
+    postprocessor, i.e. what produced the TensorBoard numbers) and compare with
+    the bridge predictions.
+    """
+    import tempfile
+    from engine.core import YAMLConfig
+    from engine.solver import TASKS
+
+    info = args.run_info
+    run_size = info['run_size']
+    cfg = YAMLConfig(str(args.config), resume=str(args.checkpoint), device=args.device,
+                     output_dir=tempfile.mkdtemp(prefix='rtdetrv4_selfcheck_'))
+    if 'HGNetv2' in cfg.yaml_cfg:
+        cfg.yaml_cfg['HGNetv2']['pretrained'] = False
+    cfg.yaml_cfg['eval_spatial_size'] = run_size
+    loader = cfg.yaml_cfg['val_dataloader']
+    loader.pop('total_batch_size', None)
+    loader.update(batch_size=1, num_workers=0, shuffle=False)
+    dataset = loader['dataset']
+    dataset.update(ann_file=str(gt_file), img_folder=str(info['img_root']))
+    for op in (dataset.get('transforms') or {}).get('ops', []):
+        if op.get('type') == 'Resize':
+            op['size'] = list(run_size)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        solver = TASKS[cfg.yaml_cfg['task']](cfg)
+        solver.eval()
+    model = solver.ema.module if solver.ema else solver.model
+    model.eval()
+    if any(size % MAX_STRIDE for size in run_size):
+        for module in model.modules():
+            if hasattr(module, '_generate_anchors') and hasattr(module, 'eval_spatial_size'):
+                module.eval_spatial_size = None
+    postprocessor = solver.postprocessor.eval()
+    repo_names = info['model_classes']
+
+    by_id = {r['img_id']: r for r in records}
+    worst = dict(box=0.0, score=0.0, keypoint=0.0)
+    label_mismatch, compared = 0, 0
+    for samples, targets in solver.val_dataloader:
+        image_id = int(targets[0]['image_id'])
+        if image_id not in by_id:
+            continue
+        outputs = model(samples.to(solver.device))
+        sizes = torch.stack([t['orig_size'] for t in targets]).to(solver.device)
+        result = {k: v.detach().float().cpu() if torch.is_tensor(v) else v
+                  for k, v in postprocessor(outputs, sizes)[0].items()}
+        mine = by_id[image_id]['pred_instances']
+        n = min(len(mine['scores']), len(result['scores']))
+        worst['box'] = max(worst['box'], float((result['boxes'][:n].numpy() - mine['bboxes'][:n]).__abs__().max()))
+        worst['score'] = max(worst['score'], float(abs(result['scores'][:n].numpy() - mine['scores'][:n]).max()))
+        if mine.get('keypoints') is not None and 'keypoints_xy' in result:
+            worst['keypoint'] = max(worst['keypoint'], float(
+                abs(result['keypoints_xy'][:n].numpy() - mine['keypoints'][:n]).max()))
+        repo_labels = [repo_names[int(l)] for l in result['labels'][:n]]
+        my_labels = [label_names[int(l)] for l in mine['labels'][:n]]
+        label_mismatch += sum(a != b for a, b in zip(repo_labels, my_labels))
+        compared += 1
+        if compared >= num_images:
+            break
+
+    ok = (compared > 0 and label_mismatch == 0 and worst['box'] < 0.05
+          and worst['score'] < 1e-4 and worst['keypoint'] < 0.05)
+    print(f'\n── Self-check vs the repo validation path ({compared} images) ──')
+    print(f'  max |box| diff {worst["box"]:.4f}px  |  max |score| diff {worst["score"]:.2e}  |  '
+          f'max |keypoint| diff {worst["keypoint"]:.4f}px  |  label mismatches {label_mismatch}')
+    print('  RESULT: ' + ('IDENTICAL to the training validation pipeline' if ok else
+                          'DIFFERENT from the training validation pipeline — see numbers above'
+                          + (' (expected with --fp16 or batch size > 1)' if args.fp16 or
+                             args.batch_size > 1 else '')))
+    return ok
 
 
 # ── pkl -> class-aware COCO list (toolkit: pkl_to_coco + filter_predictions) ──
@@ -626,6 +738,15 @@ def run(args):
             pickle.dump(records, f)
         num_dets = sum(len(p['pred_instances']['scores']) for p in records)
         print(f'Saved {len(records)} RT-DETRv4 predictions ({num_dets} detections) → {pkl_path}')
+        if args.self_check > 0:
+            if args.override_input_size:
+                print('Self-check skipped: --override-input-size runs a resolution the '
+                      'training validation never used')
+            else:
+                try:
+                    self_check(args, records, label_names, gt_file, args.self_check)
+                except Exception as error:  # the check must never break the export
+                    print(f'Self-check could not run: {type(error).__name__}: {error}')
     if not label_names:
         raise ValueError('No class names: add class_names to the YAML or pass --class-order')
 
@@ -692,6 +813,9 @@ def build_parser():
                        help='Class names in the evaluation label order (MODEL_CLASSES); '
                             'pkl labels are remapped by name. Default: YAML class_names')
     model.add_argument('--fp16', action='store_true')
+    model.add_argument('--self-check', type=int, default=10, metavar='N',
+                       help='Re-run the first N val images through the repo validation path '
+                            '(the TensorBoard pipeline) and compare predictions (0 = off)')
     model.add_argument('--force', action='store_true',
                        help='Rerun inference even if predictions.pkl exists')
 
